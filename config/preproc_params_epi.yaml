@@ -1,0 +1,79 @@
+# preproc_params_stim.yaml
+# Parameters for gold standard MEG/EEG preprocessing
+
+bids_root: /Users/gm33/data/epi
+subject: "010MPA"
+session: "01"
+run: "01"
+task: "stimulation"
+
+# -------- HEAD MOVEMENT COMPENSATION --------
+head_movement:
+  enabled: true
+
+# -------- Calibration files for Maxwell filtering --------
+calibration_fname: /Users/gm33/data/cals/sss_cal_factory_20230619.dat
+cross_talk_fname: /Users/gm33/data/cals/ct_sparse_triux2.fif
+
+# -------- Line frequency for notch filter (before bad detection) --------
+line_freq: 60.0
+
+# -------- Stimulus event bitmask --------
+stim_include_mask: 0xC000  # Only bits 14 and 15 included
+
+# -------- HEAD POSITION ORIGIN --------
+# null = use dev_head_t of current file; or specify a path to another .fif or coordinates
+head_position_origin: null
+
+# -------- EEG HANDLING --------
+eeg_handling:
+  montage: /Users/gm33/PythonProject/EasyCap_53.sfp  # absolute path recommended
+
+# -------- QC & INTERACTIVE PARAMETERS --------
+interactive_bad_channels: true
+interactive_ica: true
+
+manual_bad_channels: []         # override only if needed
+ica_exclude_eeg: []             # manually exclude EEG ICA components, or leave blank
+ica_exclude_meg: []             # manually exclude MEG ICA components, or leave blank
+
+# -------- AUTOMATED BAD DETECTION THRESHOLDS --------
+auto_bad_flat_thresh_meg: 1e-13
+auto_bad_flat_thresh_eeg: 1e-7
+auto_bad_noisy_thresh: 5.0
+bad_channel_plot_n_channels: 16
+
+# -------- ICA PREPROCESSING PARAMETERS --------
+ica_preprocessing:
+  eeg:
+    highpass: 1.0
+    lowpass: 40.0
+    resample_hz: 200
+    max_ica_duration_sec: null
+    interactive: true
+    random_state: 97
+
+  meg:
+    highpass: 1.0
+    lowpass: 40.0
+    resample_hz: 200
+    max_ica_duration_sec: null
+    interactive: true
+    random_state: 97
+
+# -------- FINAL FILTERING AND DOWNSAMPLING (before save) --------
+final_filter:
+  highpass: null
+  lowpass: 40
+  resample_hz: null
+  drop_channel_types:
+    - hpi
+    - hlc
+    - coil
+
+# -------- METADATA FIXES (OPTIONAL) --------
+metadata_fixes:
+  fix_non_eeg_channels: {}
+  fix_generic: {}
+  expert_patch: |
+    print("✅ Expert patch executed successfully.")

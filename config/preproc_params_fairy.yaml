@@ -1,0 +1,49 @@
+# preproc_params.yaml – Parameters for gold standard MEG/EEG preprocessing
+
+bids_root: /Users/gm33/data/fairy
+subject: "008MPA"
+session: "01"
+run: "01"
+task: "fairy"
+
+calibration_fname: /Users/gm33/data/cals/sss_cal_factory_20230619.dat
+cross_talk_fname: /Users/gm33/data/cals/ct_sparse_triux2.fif
+
+line_freq: 60.0
+
+n_trim: 2.0
+stim_include_mask: 0xFFFF
+
+# -------- HEAD POSITION ORIGIN (for run alignment) --------
+# null = use first run's dev_head_t and log it; fill with [x, y, z] for subsequent runs
+head_position_origin: null
+
+# -------- EEG HANDLING --------
+eeg_handling:
+  montage: ~/PythonProject/EasyCap_53.sfp
+
+# -------- QC & INTERACTIVE FLAGS --------
+interactive_bad_channels: true      # Prompt for manual bad review
+interactive_ica: true              # Prompt for ICA review
+manual_bad_channels: []            # Force as bad, e.g. ["EEG001"]
+ica_exclude_eeg: []
+ica_exclude_meg: []
+
+# -------- AUTOMATED BAD THRESHOLDS --------
+auto_bad_flat_thresh_meg: 1e-13
+auto_bad_flat_thresh_eeg: 1e-7
+auto_bad_noisy_thresh: 5.0
+
+# -------- METADATA REPAIR (YAML-driven & expert) --------
+metadata_fixes:
+  fix_non_eeg_channels:
+    BIO001: {name: EOGv, type: eog}
+  fix_generic:
+    device_info:
+      type: 'KIT'
+      site: 'Yale'
+    meas_date: '2024-07-01T12:00:00'
+  expert_patch: |
+    print("Expert patch test: Hello from expert mode!")
+    # Example: forcibly set experimenter field
+    raw.info['experimenter'] = 'Dr. Example'

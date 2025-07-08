@@ -1,0 +1,71 @@
+# preproc_params.yaml
+# Parameters for gold standard MEG/EEG preprocessing
+
+bids_root: "/Users/gm33/data/epi"
+subject: "010MPA"
+session: "01"
+run: "01"
+task: "rest"
+
+calibration_fname: "/Users/gm33/data/cals/sss_cal_factory_20230619.dat"
+cross_talk_fname: "/Users/gm33/data/cals/ct_sparse_triux2.fif"
+
+line_freq: 60.0
+
+n_trim: 2.0
+stim_include_mask: 0xFFFF
+
+# -------- HEAD POSITION ORIGIN (for run alignment) --------
+head_position_origin:
+  # fif_file: "/path/to/ref_file.fif"
+  # coordinates: [0.0, 0.0, 0.04]
+
+# -------- HEAD MOVEMENT COMPENSATION --------
+head_movement:
+  enabled: true                      # true: apply head movement correction; false: skip
+  #pos_file: "/Users/gm33/data/epi/sub-010MPA/ses-01/meg/sub-010MPA_ses-01_task-rest_run-01_headpos.pos"
+                                     # If blank or omitted, will attempt to compute from continuous HPI in .fif
+
+# -------- EEG HANDLING --------
+eeg_handling:
+  montage: "/Users/gm33/PythonProject/EasyCap_53.sfp"
+
+# ------------- QC & INTERACTIVE/MANUAL PARAMETERS -------------
+interactive_bad_channels: true      # true: prompt for manual bad channel review, false: skip or use manual_bad_channels
+interactive_ica: true              # true: prompt for ICA review, false: skip or use ica_exclude_* lists
+
+manual_bad_channels: []            # List of channels to force as bad (e.g., ["EEG001", "MEG1231"]) or leave empty to skip
+ica_exclude_eeg: []                # List of EEG ICA indices to exclude, or leave empty for manual
+ica_exclude_meg: []                # List of MEG ICA indices to exclude, or leave empty for manual
+
+# ------------- AUTOMATED BAD DETECTION THRESHOLDS -------------
+auto_bad_flat_thresh_meg: 1e-13    # MEG flat threshold (T)
+auto_bad_flat_thresh_eeg: 1e-7     # EEG flat threshold (V)
+auto_bad_noisy_thresh: 5.0         # Noisy threshold (N x median)
+bad_channel_plot_n_channels: 16
+
+# ------------- ICA PREPROCESSING PARAMETERS -------------
+ica_preprocessing:
+  eeg:
+    highpass: 1.0        # Hz, set to null for no filter
+    lowpass: 40.0        # Hz, set to null for no filter
+    resample_hz: 100     # Hz, set to 0 or null for no resampling
+    max_ica_duration_sec: 1800  # optional: crop to first 1800 seconds (30 min); omit for full duration
+
+  meg:
+    highpass: 1.0
+    lowpass: 40.0
+    resample_hz: 100
+    max_ica_duration_sec: 1800  # optional: crop to first 1800 seconds; omit for full duration
+
+# ------------- Optional Final Filter -------------
+final_filter:
+  lowpass: 55.0
+  highpass: null       # or 1.0 if needed
+  resample_hz: 250     # optional, skip if you want native rate
+
+# ------------- METADATA FIXES (OPTIONAL) -------------
+metadata_fixes:
+  fix_non_eeg_channels: {}
+  fix_generic: {}
+  expert_patch: ""
