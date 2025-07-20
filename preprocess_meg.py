@@ -33,6 +33,11 @@ from mne_bids import BIDSPath
 from scipy.signal import find_peaks
 import json
 
+from bids_io_utils import fetch_bids_data_and_sidecars, push_bids_derivatives_rsync, detect_environment
+from bids_io_utils import write_bids_robust, read_raw_bids_robust
+from bids_io_utils import get_all_bids_split_files, get_bids_headpos_path
+from glob import glob
+
 PIPELINE_VERSION = "1.0"
 
 # ========== YAML SUPPORT ==========
@@ -101,27 +106,60 @@ def get_runtime_info() -> Dict[str, Any]:
         "user": getpass.getuser(),
     }
 
-# ========== Function to replace MNE-BIDS raw data read ==========
-def read_raw_bids_robust(bids_path, **kwargs):
-    """
-    Drop-in replacement for mne_bids.read_raw_bids for MEG FIF files.
-    Accepts a BIDSPath and loads data with plain MNE, bypassing split file ambiguity.
-    """
-    if isinstance(bids_path, dict):
-        subject = bids_path["subject"]
-        session = bids_path.get("session", None)
-        task = bids_path.get("task", None)
-        run = bids_path.get("run", None)
-        datatype = bids_path.get("datatype", "meg")
-        root = bids_path["bids_root"]
-    else:
-        subject = bids_path.subject
-        session = bids_path.session
-        task = bids_path.task
-        run = bids_path.run
-        datatype = bids_path.datatype
-        root = bids_path.root
+# ========== Workflow Determination ==========
 
+def is_hybrid_workflow(bids_root, out_fif):
+    """
+    Returns True if the workflow is 'hybrid' (e.g., run locally but data or output is remote), else False.
+    You can make this as strict or loose as you want!
+    """
+    # Example: local is '/Users/', remote is '/gpfs/' (customize for your lab)
+    is_local_bids = str(bids_root).startswith("/Users/")
+    is_local_out = str(out_fif).startswith("/Users/")
+    # Hybrid if data or output is not local
+    return not (is_local_bids and is_local_out)
+
+# ========== Check paths and critical files ==========
+
+def find_repo_root(start_path=None, marker='.git'):
+    """Walk up from start_path until a directory containing 'marker' is found."""
+    if start_path is None:
+        start_path = Path(__file__).resolve().parent
+    else:
+        start_path = Path(start_path).resolve()
+    for parent in [start_path] + list(start_path.parents):
+        if (parent / marker).exists():
+            return parent
+    raise FileNotFoundError(f"Repo root not found using marker '{marker}'.")
+
+def resolve_path_from_repo_root(user_path, repo_root):
+    """Return absolute Path: if relative, resolve from repo_root."""
+    p = Path(user_path)
+    return p if p.is_absolute() else repo_root / p
+
+def get_and_check_path(cfg_dict, key, repo_root, description="file"):
+    user_path = cfg_dict.get(key)
+    if user_path is None:
+        raise ValueError(f"No {description} specified in the config under {key}")
+    resolved = resolve_path_from_repo_root(user_path, repo_root)
+    if not resolved.exists():
+        raise FileNotFoundError(f"{description.capitalize()} not found: {resolved}")
+    return resolved
+
+def check_critical_files_exist(config, repo_root):
+    files_to_check = [
+        # Each item: (dict, key, description)
+        (config.get("eeg_handling", {}), "montage", "montage file"),
+        (config, "calibration_file", "MEG calibration file"),
+        (config, "cross_talk_file", "MEG crosstalk file"),
+        # Add more as needed
+    ]
+    checked_paths = {}
+    for cfg_dict, key, desc in files_to_check:
+        checked_paths[key] = get_and_check_path(cfg_dict, key, repo_root, desc)
+    return checked_paths
+
+def get_bids_headpos_path(subject, session, task, run, meg_dir):
     fname = f"sub-{subject}"
     if session:
         fname += f"_ses-{session}"
@@ -129,22 +167,8 @@ def read_raw_bids_robust(bids_path, **kwargs):
         fname += f"_task-{task}"
     if run:
         fname += f"_run-{run}"
-    fname += f"_{datatype}.fif"
-
-    fif_file = os.path.join(
-        root, f"sub-{subject}",
-        f"ses-{session}" if session else "",
-        datatype,
-        fname
-    )
-    fif_file = fif_file.replace("//", "/")
-
-    if not os.path.exists(fif_file):
-        raise FileNotFoundError(f"Base MEG FIF file not found: {fif_file}")
-
-    raw = mne.io.read_raw_fif(fif_file, preload=True, **kwargs)
-    return raw
-
+    fname += "_headpos.pos"
+    return os.path.join(meg_dir, fname)
 
 # ========== CORE MODULES ==========
 
@@ -511,6 +535,8 @@ def run_ica(raw: mne.io.Raw, config: dict, output_path: Path, modality: str) -> 
     exclude = list(ica.exclude)
 
     raw_clean = ica.apply(raw.copy())
+    output_dir = os.path.dirname(str(output_path))
+    os.makedirs(output_dir, exist_ok=True)
     ica.save(str(output_path), overwrite=True)
     logger.info(f"Excluded {modality.upper()} ICA components: {exclude}")
     return raw_clean, exclude
@@ -538,7 +564,6 @@ def bitwise_events(raw: mne.io.Raw, mask: int = 0xFFFF, min_high: int = 2, min_o
                 events.append([r[0], 0, code])
                 last_rise = r[0]
     return np.array(sorted(events), dtype=int)
-
 
 def apply_final_filter_and_cleanup(raw: mne.io.Raw, config: dict) -> mne.io.Raw:
     """
@@ -585,13 +610,36 @@ def apply_final_filter_and_cleanup(raw: mne.io.Raw, config: dict) -> mne.io.Raw:
 def run_pipeline(yaml_path: str):
     """
     Orchestrate full preprocessing pipeline using config file.
-    Includes all diagnostics, ICA, Maxwell, events, and full YAML logging.
     """
+    import os
+    import sys
+
+    log_section("1. Load config and check paths and critical files")
+    # 1.1 Check that the YAML config file exists
     if not os.path.exists(yaml_path):
         logger.error(f"Config file not found: {yaml_path}")
         sys.exit(1)
 
+    # 1.2 Load YAML config
     p = load_yaml(yaml_path)
+
+    # 1.3 Set repo root as the directory containing this script
+    repo_root = Path(__file__).resolve().parent
+    logger.info(f"Repo root set to: {repo_root}")
+
+    # 1.4 Check all critical files (fail fast if missing)
+    try:
+        checked_paths = check_critical_files_exist(p, repo_root)
+    except (ValueError, FileNotFoundError) as e:
+        logger.error(str(e))
+        sys.exit(1)
+
+    # 1.5 (Optional) Print/log resolved file paths for debug
+    logger.info(f"All critical files found:")
+    for key, path in checked_paths.items():
+        logger.info(f"  {key}: {path}")
+
+    # ------ MAIN PIPELINE MODULES BEGIN HERE ------
     runtime_info = get_runtime_info()
 
     subject = p["subject"]
@@ -599,20 +647,43 @@ def run_pipeline(yaml_path: str):
     task = p.get("task", None)
     run = p.get("run", None)
     bids_root = p["bids_root"]
+    hpc_host = p.get("hpc_host")
+    hpc_user = p.get("hpc_user")
 
-    # Construct canonical BIDSPath for input
+    # Detect execution environment
+    ENV = detect_environment(hpc_hostname_tag="milgram")
+
+    # Decide where data lives and whether to fetch
+    if ENV == "hpc" or bids_root.startswith("/Users"):
+        # Data is local to execution environment; just use as-is
+        local_bids_root = bids_root
+    else:
+        # Running locally, data lives on HPC: fetch/copy/cached to temp
+        temp_dir = p.get("temp_dir", "./temp")
+        # Compute BIDS MEG dir and base_stem
+        base_stem = f"sub-{subject}"
+        if session: base_stem += f"_ses-{session}"
+        if task: base_stem += f"_task-{task}"
+        if run: base_stem += f"_run-{run}"
+        # base_stem += "_meg"
+        remote_meg_dir = os.path.join(bids_root, f"sub-{subject}", f"ses-{session}" if session else "", "meg")
+        local_bids_root = os.path.join(temp_dir, "bids")
+        local_meg_dir = os.path.join(local_bids_root, f"sub-{subject}", f"ses-{session}" if session else "", "meg")
+        fetch_bids_data_and_sidecars(hpc_host, hpc_user, remote_meg_dir, base_stem, local_meg_dir)
+
+    # Construct canonical BIDSPath for input (now points to the local cache or as before)
     bids_path = BIDSPath(
         subject=subject,
         session=session,
         task=task,
         run=run,
         datatype="meg",
-        root=bids_root
+        root=local_bids_root  # ***THIS IS THE ONLY CHANGE***
     )
 
     # Construct correct BIDS-compliant derivative path and filename
     bids_path_deriv = bids_path.copy().update(
-        root=Path(bids_root) / "derivatives" / "preprocessing",
+        root=Path(local_bids_root) / "derivatives" / "preprocessing",
         suffix="meg",
         description="preproc",
         extension=".fif"
@@ -620,14 +691,31 @@ def run_pipeline(yaml_path: str):
     bids_path_ica_eeg = bids_path_deriv.copy().update(description="preprocICAeeg")
     bids_path_ica_meg = bids_path_deriv.copy().update(description="preprocICAmeg")
 
-    log_section("1. Load Raw Data")
+    log_section("2. Load Raw Data")
     raw = read_raw_bids_robust(bids_path)
+    raw_fif_path = raw.filenames[0]  # Use the actual file loaded by MNE
 
-    log_section("2. Compute or Load Head Position")
+    # Build the MEG directory and expected .pos filename from BIDS fields
+    meg_dir = os.path.dirname(raw_fif_path)
+    subject = bids_path.subject
+    session = bids_path.session
+    task = bids_path.task
+    run = bids_path.run
+
+    # Use the BIDS convention to find the headpos file
+    expected_pos_file = get_bids_headpos_path(subject, session, task, run, meg_dir)
+    if os.path.exists(expected_pos_file):
+        pos_file_requested = expected_pos_file
+        print(f"Using existing head position file: {pos_file_requested}")
+    else:
+        pos_file_requested = None
+        print("No matching headpos.pos file found. Will compute if needed.")
+
+    log_section("3. Compute or Load Head Position")
+    new_headpos_computed = False
 
     head_movement_cfg = p.get("head_movement", {})
     movement_enabled = head_movement_cfg.get("enabled", False)
-    pos_file_requested = head_movement_cfg.get("pos_file", "").strip() or None
 
     head_pos_array = None
     head_pos_path = None
@@ -659,50 +747,60 @@ def run_pipeline(yaml_path: str):
     else:
         logger.info("Head movement correction is disabled.")
 
-    log_section("3. EEG Channel Setup")
-    eeg_cfg = p.get('eeg_handling', {})
-    montage_path = eeg_cfg.get("montage")
-    eeg_status = prepare_eeg_channels(raw, montage_path, logger)
+    if movement_enabled and (pos_file_requested is None):
+        # If you passed None, then you wanted to compute if missing
+        if head_pos_path and os.path.exists(head_pos_path):
+            new_headpos_computed = True
 
-    log_section("4. Metadata Repair")
+    log_section("4. EEG Channel Setup")
+    eeg_cfg = p.get('eeg_handling', {})
+
+    # Get the already-resolved montage path from checked_paths
+    montage_path = checked_paths["montage"]
+
+    eeg_status = prepare_eeg_channels(raw, str(montage_path), logger)
+
+    log_section("5. Metadata Repair")
     metadata_fixes = p.get('metadata_fixes', {})
     metadata_log = apply_metadata_repairs(raw, metadata_fixes)
 
-    log_section("5. PSD & RMS Diagnostics (Pre-filtering)")
+    log_section("6. PSD & RMS Diagnostics (Pre-filtering)")
     qc_meg_raw(raw)
     plot_psd_and_peaks(raw, "Raw PSD Before Notch", 400)
 
-    log_section("6. Notch Filter")
+    log_section("7. Notch Filter")
     line_freq = float(p.get("line_freq", 60.0))
     notch_freqs = [line_freq * i for i in range(1, 5)]
     picks = mne.pick_types(raw.info, meg=True, eeg=True, exclude='bads')
     raw.notch_filter(notch_freqs, picks=picks, method='fir', filter_length='auto')
     plot_psd_and_peaks(raw, "After Notch", 400)
 
-    log_section("7. Bad Channel Detection")
+    log_section("8. Bad Channel Detection")
     final_bads = handle_bad_channels(raw, p, logger)
 
-    log_section("8. Maxwell Filter (tSSS)")
+    log_section("9. Maxwell Filter (tSSS)")
+
     raw = apply_maxwell_filter(
         raw,
         head_pos=head_pos_array,
         destination=None,
-        cal=p.get("calibration_fname"),
-        crosstalk=p.get("cross_talk_fname")
+        cal=str(checked_paths["calibration_file"]),
+        crosstalk=str(checked_paths["cross_talk_file"])
     )
+
     plot_psd_and_peaks(raw, "After Maxwell", 400)
 
-    log_section("9. ICA: EEG")
+    log_section("10. ICA: EEG")
     ica_eeg_cfg = p["ica_preprocessing"]["eeg"]
     raw, eeg_exclude = run_ica(raw, ica_eeg_cfg, bids_path_ica_eeg.fpath, modality="eeg")
 
-    log_section("10. ICA: MEG")
+    log_section("11. ICA: MEG")
     ica_meg_cfg = p["ica_preprocessing"]["meg"]
     raw, meg_exclude = run_ica(raw, ica_meg_cfg, bids_path_ica_meg.fpath, modality="meg")
 
     plot_psd_and_peaks(raw, "After ICA", 400)
 
-    log_section("11. Event Detection")
+    log_section("12. Event Detection")
     events = bitwise_events(raw)
     event_counts = {}
     if events.size:
@@ -715,15 +813,15 @@ def run_pipeline(yaml_path: str):
     else:
         logger.warning("No events detected")
 
-    log_section("12. Optional Final Filter, Downsample, and Cleanup")
+    log_section("13. Optional Final Filter, Downsample, and Cleanup")
     raw = apply_final_filter_and_cleanup(raw, p)
 
-    log_section("13. Save Final Data")
+    log_section("14. Save Final Data")
     out_fif = bids_path_deriv.fpath
-    raw.save(str(out_fif), overwrite=True)
+    written_files = write_bids_robust(raw, bids_path_deriv, overwrite=True, verbose=True)
     logger.info(f"Saved preprocessed data to: {out_fif}")
 
-    log_section("14. Write YAML and JSON Log")
+    log_section("15. Write YAML and JSON Log")
 
     # Final filter summary (if it was applied)
     final_filter_cfg = p.get("final_filter", {})
@@ -751,9 +849,20 @@ def run_pipeline(yaml_path: str):
         "meg_duration_sec": raw.times[-1] if 'meg_exclude' in locals() else None
     }
 
+    # Gather all written output files (including splits)
+    main_output_files = get_all_bids_split_files(out_fif)
+
+    # ICA output FIFs and their splits
+    ica_output_files = []
+    for ica_fif in [bids_path_ica_eeg.fpath, bids_path_ica_meg.fpath]:
+        ica_output_files += get_all_bids_split_files(ica_fif)
+    ica_output_files = list(dict.fromkeys(ica_output_files))  # In case both ICA point to same file
+
     yaml_log = {
         "input_config": yaml_path,
-        "bids_path": str(bids_path),
+        "bids_basefile": str(out_fif),
+        "main_output_files": main_output_files,
+        "ica_output_files": ica_output_files,
         "output_file": str(out_fif),
         "runtime_info": runtime_info,
         "recording_duration_sec": float(recording_duration_sec),
@@ -780,6 +889,53 @@ def run_pipeline(yaml_path: str):
     with open(out_log_json, "w") as f:
         json.dump(make_serializable(yaml_log), f, indent=2)
     logger.info(f"JSON log written to: {out_log_json}")
+
+    ENV = detect_environment(hpc_hostname_tag="milgram")
+
+    main_output_files = write_bids_robust(raw, out_fif, overwrite=True, verbose=True)
+
+    # --- Gather ICA outputs ---
+    ica_output_files = []
+    for ica_fif in [bids_path_ica_eeg.fpath, bids_path_ica_meg.fpath]:
+        ica_output_files += get_all_bids_split_files(ica_fif)
+    ica_output_files = list(dict.fromkeys(ica_output_files))  # Deduplicate
+
+    # --- Gather all outputs for logging/upload ---
+    outputs_to_push = [str(out_log_yaml), str(out_log_json)] + main_output_files + ica_output_files
+    outputs_to_push = list(dict.fromkeys(outputs_to_push))  # Deduplicate
+
+    # Gather all outputs: logs, main FIF and splits, ICA FIFs and splits
+    outputs_to_push = [str(out_log_yaml), str(out_log_json)] + main_output_files + ica_output_files
+    outputs_to_push = list(dict.fromkeys(outputs_to_push))  # Remove duplicates, preserve order
+
+    if is_hybrid_workflow(p["bids_root"], out_fif):
+        print("\n[User action required]")
+        print(
+            "Processing complete. Press ENTER when ready to upload all derivatives to the HPC (be ready for DUO prompt).")
+        input()
+        push_bids_derivatives_rsync(
+            local_bids_root="./temp/BIDS",  # Your local BIDS cache root
+            remote_bids_root=p["bids_root"],  # Remote BIDS root on HPC
+            hpc_host=p["hpc_host"],
+            hpc_user=p["hpc_user"],
+            verbose=True
+        )
+        if new_headpos_computed:
+            print(
+                "\nA new head position .pos file was computed. Press ENTER to upload it to the HPC raw folder (be ready for DUO prompt).")
+            input()
+            # Build the path relative to local BIDS root
+            local_bids_root = os.path.abspath("./temp/BIDS")
+            rel_path = os.path.relpath(pos_path, start=local_bids_root)
+            remote_file = os.path.join(p["bids_root"], rel_path)
+            remote_dir = os.path.dirname(remote_file)
+            remote_spec = f"{p['hpc_user']}@{p['hpc_host']}:{remote_dir}/"
+            print(f"Pushing new/updated headpos file: {pos_path} -> {remote_spec}")
+            import subprocess
+            subprocess.run(["scp", "-v", pos_path, remote_spec], check=True)
+            print("[info] Head position file upload complete.")
+    else:
+        print("[info] No remote data used or output—skipping remote upload step.")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
