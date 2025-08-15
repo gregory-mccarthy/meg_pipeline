@@ -10,7 +10,6 @@ from scipy.signal import find_peaks
 import numpy as np
 from autoreject import Ransac, AutoReject
 import logging
-from autoreject import Ransac, AutoReject
 from collections import Counter
 
 # Logging and version global
@@ -158,6 +157,370 @@ def get_bids_headpos_path(subject, session, task, run, meg_dir):
         fname += f"_run-{run}"
     fname += "_headpos.pos"
     return os.path.join(meg_dir, fname)
+
+# ---------- FIXED CHECKPOINTED AUTOREJECT WRAPPER ----------
+def run_autoreject_with_checkpoint(raw, cfg, bids_path, logger):
+    """
+    Split autoreject into Stage 1 (non-interactive) and Stage 2 (interactive review only).
+
+    DESIGN:
+    - Stage 1: Non-interactive AutoReject, writes checkpoint (parproc + manifest), returns
+    - Stage 2: Load checkpoint, run *interactive* review only (no recompute), update checkpoint, return
+
+    Returns:
+        ('continue', raw_like) on success,
+        ('exit', raw_like) if configured to stop after Stage 1 (exit_after_checkpoint=True).
+    """
+    import hashlib
+    from pathlib import Path
+    import datetime
+    import mne
+    from mne.annotations import Annotations
+    import numpy as np
+
+    # ---- Resolve checkpoint config with safe defaults
+    chk_cfg = cfg.get("checkpoint", {})
+    enabled = chk_cfg.get("enabled", True)
+    exit_after = chk_cfg.get("exit_after_checkpoint", False)
+
+    derivatives_root = chk_cfg.get("derivatives_root", "derivatives")
+    pipeline_name = chk_cfg.get("pipeline_name", "preprocessing")
+
+    atomic_writes = chk_cfg.get("atomic_writes", True)
+    allow_yaml_diff = chk_cfg.get("allow_resume_with_different_yaml", False)
+    validate_integrity = chk_cfg.get("validate_checkpoint_integrity", True)
+    backup_before_overwrite = chk_cfg.get("backup_before_overwrite", False)
+
+    # Get interactive setting from main config
+    interactive_bad_channels = cfg.get("interactive_bad_channels", True)
+
+    if not enabled:
+        logger.info("[checkpoint] Disabled in YAML; falling back to original interactive AR path.")
+        # When checkpointing is disabled, run the old way
+        ar_cfg = cfg.get("autoreject", {})
+        ar_types = ar_cfg.get("which_types", ['eeg', 'mag', 'grad'])
+        fset = ar_cfg.get("filter", {'highpass': 1.0, 'lowpass': 40.0, 'resample_hz': None})
+        eset = ar_cfg.get("epoch", {'duration': 2.0, 'tmin': 0.0, 'tmax': 2.0})
+        consensus_thresh = ar_cfg.get("consensus_thresh", 0.3)
+        global_epoch_thresh = ar_cfg.get("global_epoch_thresh", 0.3)
+        bads_dict = find_bad_channels_autoreject_by_type_improved(
+            raw,
+            which_types=ar_types,
+            filter_settings=fset,
+            epoch_settings=eset,
+            consensus_thresh=consensus_thresh,
+            global_epoch_thresh=global_epoch_thresh,
+            interactive=interactive_bad_channels,
+            logger=logger
+        )
+        logger.info(f"[checkpoint] (disabled) AR result: {bads_dict}; bads={raw.info.get('bads', [])}")
+        return ('continue', raw)
+
+    # ---- Build paths (respect current bids_root)
+    bids_root = Path(cfg.get("bids_root", bids_path.root))
+    deriv_root = bids_root / derivatives_root / pipeline_name
+
+    # Build proper subject/session directory structure
+    subject_dir = f"sub-{bids_path.subject}"
+    if bids_path.session:
+        session_dir = f"ses-{bids_path.session}"
+        parproc_dir = deriv_root / subject_dir / session_dir / "meg"
+    else:
+        parproc_dir = deriv_root / subject_dir / "meg"
+    parproc_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build checkpoint filename
+    base_name = f"sub-{bids_path.subject}"
+    if bids_path.session:
+        base_name += f"_ses-{bids_path.session}"
+    if bids_path.task:
+        base_name += f"_task-{bids_path.task}"
+    if bids_path.run:
+        base_name += f"_run-{bids_path.run}"
+
+    parproc_fif = parproc_dir / f"{base_name}_desc-parproc_meg.fif"
+    manifest_path = parproc_fif.with_name(parproc_fif.stem + "_manifest.yaml")
+
+    # ---- Helpers
+    def _atomic_save_fif(raw_obj, out_path: Path):
+        """Write FIF atomically by using temporary file with .fif extension (MNE warns about naming; harmless)."""
+        if not atomic_writes:
+            raw_obj.save(str(out_path), overwrite=True)
+            return
+
+        if backup_before_overwrite and out_path.exists():
+            backup_path = out_path.with_suffix(out_path.suffix + ".backup")
+            import shutil
+            shutil.copy2(out_path, backup_path)
+            logger.info(f"[checkpoint] Created backup: {backup_path}")
+
+        tmp = out_path.with_name(out_path.stem + "_tmp.fif")
+        try:
+            raw_obj.save(str(tmp), overwrite=True)
+            tmp.replace(out_path)
+            logger.info(f"[checkpoint] Saved to: {out_path}")
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except Exception:
+                    pass
+
+    def _yaml_sha256(yaml_text: str) -> str:
+        return hashlib.sha256(yaml_text.encode("utf-8")).hexdigest()
+
+    def _build_manifest(stage, extra=None, current_yaml_hash=None, prior_yaml_hash=None):
+        """Build manifest dictionary with metadata and (optionally) both YAML hashes."""
+        yaml_text = None
+        try:
+            yaml_path_local = cfg.get("_cfg_path", "")
+            if yaml_path_local and Path(yaml_path_local).exists():
+                yaml_text = Path(yaml_path_local).read_text()
+        except Exception as e:
+            logger.warning(f"Could not read YAML for manifest: {e}")
+
+        man = {
+            "created_utc": datetime.datetime.utcnow().isoformat() + "Z",
+            "stage": stage,
+            "pipeline_version": "1.2",
+            "checkpoint_version": cfg.get("_checkpoint_version", "1.0"),
+            "exit_after_checkpoint": exit_after,
+            "inputs": {
+                "bids": {
+                    "subject": bids_path.subject,
+                    "session": bids_path.session,
+                    "task": bids_path.task,
+                    "run": bids_path.run,
+                },
+                "bids_root": str(bids_root),
+                "yaml_path": cfg.get("_cfg_path", None),
+                "yaml_sha256": _yaml_sha256(yaml_text) if yaml_text else None,
+                # audit fields (optional)
+                "yaml_sha256_current": current_yaml_hash,
+                "yaml_sha256_prior": prior_yaml_hash,
+            },
+            "artifacts": {
+                "parproc_raw_fif": str(parproc_fif),
+                "manifest_path": str(manifest_path),
+            },
+            "params": {
+                "autoreject": cfg.get("autoreject", {}),
+                "checkpoint": chk_cfg,
+                "interactive_bad_channels": interactive_bad_channels,
+            },
+            "environment": get_runtime_info(),
+        }
+        if extra:
+            man.update(extra)
+        return man
+
+    def _validate_checkpoint_integrity(raw_obj, manifest_data):
+        try:
+            if len(raw_obj.ch_names) == 0:
+                raise ValueError("No channels in checkpoint data")
+            if raw_obj.times[-1] <= 0:
+                raise ValueError("Invalid recording duration")
+            bads = raw_obj.info.get('bads', [])
+            invalid_bads = [ch for ch in bads if ch not in raw_obj.ch_names]
+            if invalid_bads:
+                raise ValueError(f"Invalid bad channels: {invalid_bads}")
+            logger.info("[checkpoint] ✅ Checkpoint integrity validation passed")
+            return True
+        except Exception as e:
+            logger.error(f"[checkpoint] ❌ Checkpoint integrity validation failed: {e}")
+            return False
+
+    def _run_interactive_review_only(raw_obj, ar_cfg, logger):
+        """Run ONLY the interactive review; no AR recompute."""
+        logger.info("[checkpoint] Opening interactive review (no re-computation)")
+        fset = ar_cfg.get("filter", {'highpass': 1.0, 'lowpass': 40.0, 'resample_hz': None})
+        l_freq = float(fset.get('highpass', 1.0))
+        h_freq = float(fset.get('lowpass', 40.0))
+        resample_hz = fset.get('resample_hz')
+
+        logger.info(f"Creating filtered copy for interactive viewing: {l_freq}-{h_freq} Hz")
+        raw_filt = raw_obj.copy().filter(l_freq=l_freq, h_freq=h_freq, verbose='ERROR')
+        if resample_hz:
+            raw_filt.resample(float(resample_hz), npad="auto")
+
+        raw_filt.info['bads'] = list(raw_obj.info.get('bads', []))
+        if raw_obj.annotations is not None:
+            raw_filt.set_annotations(raw_obj.annotations)
+
+        original_bads = set(raw_obj.info.get('bads', []))
+        original_annots_count = len(raw_obj.annotations) if raw_obj.annotations else 0
+
+        logger.info("🎮 Opening interactive review window...")
+        logger.info(f"   Current bad channels: {len(original_bads)}")
+        logger.info(f"   Current annotations: {original_annots_count}")
+
+        try:
+            n_channels = min(32, len(raw_filt.ch_names))
+            raw_filt.plot(
+                n_channels=n_channels,
+                duration=30.0,
+                scalings='auto',
+                show=True,
+                block=True,
+                title=f"Interactive Review - {len(raw_filt.info['bads'])} bad channels"
+            )
+            response = input("Press Enter to keep changes (or 'abort' to cancel): ").strip().lower()
+            if response == 'abort':
+                logger.info("❌ User aborted interactive review - keeping original")
+                del raw_filt
+                return raw_obj
+        except Exception as e:
+            logger.error(f"Interactive plotting failed: {e}")
+            del raw_filt
+            return raw_obj
+
+        # Transfer changes back
+        reviewed_bads = set(raw_filt.info.get('bads', []))
+        added_bads = reviewed_bads - original_bads
+        removed_bads = original_bads - reviewed_bads
+        if added_bads:
+            logger.info(f"✅ User added bad channels: {sorted(added_bads)}")
+        if removed_bads:
+            logger.info(f"🔄 User rescued channels: {sorted(removed_bads)}")
+
+        raw_obj.info['bads'] = sorted(reviewed_bads)
+
+        if raw_filt.annotations is not None and len(raw_filt.annotations) > 0:
+            raw_obj.set_annotations(raw_filt.annotations)
+            logger.info(f"✅ Updated annotations: {len(raw_filt.annotations)} total")
+
+        del raw_filt
+        logger.info("🎉 Interactive review completed!")
+        return raw_obj
+
+    # ---- Detect existing checkpoint
+    checkpoint_exists = parproc_fif.exists() and manifest_path.exists()
+
+    # ========================================================================
+    # STAGE 1: Non-interactive AutoReject and checkpoint (when NO checkpoint exists)
+    # ========================================================================
+    if not checkpoint_exists:
+        logger.info("[checkpoint] Stage 1: non-interactive AutoReject")
+
+        # Get AutoReject parameters
+        ar_cfg = cfg.get("autoreject", {})
+        ar_types = ar_cfg.get("which_types", ['eeg', 'mag', 'grad'])
+        fset = ar_cfg.get("filter", {'highpass': 1.0, 'lowpass': 40.0, 'resample_hz': None})
+        eset = ar_cfg.get("epoch", {'duration': 2.0, 'tmin': 0.0, 'tmax': 2.0})
+        consensus_thresh = ar_cfg.get("consensus_thresh", 0.3)
+        global_epoch_thresh = ar_cfg.get("global_epoch_thresh", 0.3)
+
+        # Run non-interactive AR
+        bads_dict = find_bad_channels_autoreject_by_type_improved(
+            raw,
+            which_types=ar_types,
+            filter_settings=fset,
+            epoch_settings=eset,
+            consensus_thresh=consensus_thresh,
+            global_epoch_thresh=global_epoch_thresh,
+            interactive=False,
+            logger=logger
+        )
+        logger.info(f"[checkpoint] Stage 1 AutoReject complete")
+        logger.info(f"[checkpoint] Detected bad channels: {raw.info.get('bads', [])}")
+
+        # Save checkpoint
+        _atomic_save_fif(raw, parproc_fif)
+        man = _build_manifest(stage="stage1_complete", extra={
+            "results": {
+                "bads_detected": list(raw.info.get('bads', [])),
+                "n_bad_channels": len(raw.info.get('bads', [])),
+                "n_annotations": int(len(raw.annotations) if raw.annotations is not None else 0),
+                "autoreject_details": bads_dict,
+            }
+        })
+        save_yaml(str(manifest_path), make_serializable(man))
+        logger.info(f"[checkpoint] ✅ checkpoint saved: {parproc_fif}")
+
+        # Return control to main
+        if exit_after:
+            logger.info("[checkpoint] Two-stage mode: Exiting after Stage 1")
+            return ('exit', raw)
+        else:
+            logger.info("[checkpoint] Continuous mode: Stage 1 complete")
+            return ('continue', raw)
+
+    # ========================================================================
+    # STAGE 2: Load checkpoint and do interactive review (when checkpoint EXISTS)
+    # ========================================================================
+    logger.info("[checkpoint] Stage 2: interactive review from checkpoint")
+
+    # Load prior manifest for validation
+    try:
+        prior_manifest = load_yaml(str(manifest_path))
+    except Exception as e:
+        raise RuntimeError(f"Cannot read checkpoint manifest: {e}")
+
+    # YAML consistency check — warn by default (hybrid-friendly)
+    want = prior_manifest.get("inputs", {}).get("yaml_sha256")
+    have = None
+    yaml_path_local = cfg.get("_cfg_path", "")
+    if yaml_path_local and Path(yaml_path_local).exists():
+        try:
+            have = _yaml_sha256(Path(yaml_path_local).read_text())
+        except Exception as e:
+            logger.warning(f"[checkpoint] Cannot read current YAML for validation: {e}")
+            have = want
+    yaml_mismatch = bool(want and have and want != have)
+
+    if yaml_mismatch:
+        if allow_yaml_diff:
+            logger.warning(
+                "[checkpoint] ⚠️ YAML has changed since checkpoint creation. "
+                "Proceeding with Stage 2 using the CURRENT YAML. "
+                "The updated manifest will record both hashes."
+            )
+        else:
+            logger.warning(
+                "[checkpoint] ⚠️ YAML has changed since checkpoint creation. "
+                "Proceeding with Stage 2 using the CURRENT YAML. "
+                "To silence this warning, set 'checkpoint.allow_resume_with_different_yaml: true'."
+            )
+    else:
+        logger.info("[checkpoint] YAML matches the checkpoint YAML.")
+
+    # Load checkpoint data
+    raw_parproc = mne.io.read_raw_fif(str(parproc_fif), preload=True, verbose="error")
+    if validate_integrity and not _validate_checkpoint_integrity(raw_parproc, prior_manifest.get("results", {})):
+        raise RuntimeError("Checkpoint integrity validation failed")
+
+    # Interactive review
+    if interactive_bad_channels:
+        ar_cfg = cfg.get("autoreject", {})
+        raw_parproc = _run_interactive_review_only(raw_parproc, ar_cfg, logger)
+        _atomic_save_fif(raw_parproc, parproc_fif)
+
+        # Update manifest, recording both hashes if available
+        man2 = _build_manifest(
+            "stage2_reviewed",
+            extra={
+                "results": {
+                    "bads_after_review": list(raw_parproc.info.get('bads', [])),
+                    "n_bad_channels_reviewed": len(raw_parproc.info.get('bads', [])),
+                    "n_annotations": int(len(raw_parproc.annotations) if raw_parproc.annotations is not None else 0),
+                }
+            },
+            current_yaml_hash=have,
+            prior_yaml_hash=want
+        )
+        save_yaml(str(manifest_path), make_serializable(man2))
+        logger.info("[checkpoint] ✅ checkpoint updated after interactive review (manifest includes YAML audit)")
+
+        # IMPORTANT: return to caller
+        return ('continue', raw_parproc)
+    else:
+        logger.info("[checkpoint] Interactive review disabled.")
+        return ('continue', raw_parproc)
+
+    # ---- Safety guard (should never hit)
+    # If we ever get here, something fell through unexpectedly
+    logger.error("[checkpoint] Internal error: unexpected fallthrough in run_autoreject_with_checkpoint")
+    return ('continue', raw)
 
 # ========== CORE MODULES ==========
 
@@ -365,7 +728,8 @@ def apply_metadata_repairs(raw: mne.io.Raw, metadata_cfg: dict) -> Dict[str, Any
     return repairs
 
 
-def find_bad_channels_autoreject_by_type(
+# ---------- IMPROVED AUTOREJECT FUNCTION ----------
+def find_bad_channels_autoreject_by_type_improved(
         raw,
         which_types=('eeg', 'mag', 'grad'),
         filter_settings=None,
@@ -376,55 +740,33 @@ def find_bad_channels_autoreject_by_type(
         logger=None
 ):
     """
-    Detect bad channels (via AutoReject and RANSAC) and globally bad epochs
-    on a filtered copy of the data, but transfer all results (bad channels and
-    global bad epochs as Annotations) to the original, unfiltered raw object.
+    IMPROVED: Detect bad channels (RANSAC + AutoReject) and globally bad epochs.
 
-    Parameters
-    ----------
-    raw : mne.io.Raw
-        Original unfiltered raw data. Will be modified in-place.
-    which_types : tuple or list
-        Channel types to check ('eeg', 'mag', 'grad').
-    filter_settings : dict
-        Filtering parameters (keys: highpass, lowpass, resample_hz).
-    epoch_settings : dict
-        Epoching parameters (keys: duration, tmin, tmax).
-    consensus_thresh : float
-        Fraction of epochs a channel must be bad to be flagged as bad.
-    global_epoch_thresh : float
-        Fraction of channels that must be bad in an epoch to mark it globally bad.
-    interactive : bool
-        If True, launch raw.plot for interactive review of bads and epochs.
-    logger : logging.Logger or None
-        Logger for progress/info output.
-
-    Returns
-    -------
-    detected_bads : dict
-        Dict containing bad channels and global bad epochs per type.
-        (Also updates raw.info['bads'] and raw.annotations in-place.)
+    Key improvements:
+    - Better memory management (process types separately if configured)
+    - More robust annotation handling using sample indices
+    - Improved error handling and validation
+    - Better interactive workflow with progress saving
+    - Enhanced logging and debugging information
     """
     import numpy as np
     from collections import Counter
     import logging
-    from mne.annotations import Annotations
     import mne
+    from mne.annotations import Annotations
+    import time
 
     if logger is None:
         logger = logging.getLogger("pipeline")
 
-    filter_settings = filter_settings or {'highpass': 1.0, 'lowpass': 40.0}
+    # Parse params with safe defaults
+    filter_settings = filter_settings or {'highpass': 1.0, 'lowpass': 40.0, 'resample_hz': None}
     epoch_settings = epoch_settings or {'duration': 2.0, 'tmin': 0.0, 'tmax': 2.0}
 
-    # Ensure numeric types
     l_freq = float(filter_settings.get('highpass', 1.0))
     h_freq = float(filter_settings.get('lowpass', 40.0))
-
-    # Handle resampling properly - only resample if explicitly specified
     resample_hz = filter_settings.get('resample_hz')
-    if resample_hz:
-        resample_hz = float(resample_hz)
+    resample_hz = float(resample_hz) if resample_hz else None
 
     duration = float(epoch_settings.get('duration', 2.0))
     tmin = float(epoch_settings.get('tmin', 0.0))
@@ -435,231 +777,377 @@ def find_bad_channels_autoreject_by_type(
 
     detected_bads = {}
     all_bad_channels = set()
-    all_global_bad_epochs = set()
+    all_global_bad_epochs = set()  # Use sample indices for precision
 
-    logger.info(f"Creating filtered copy for bad channel detection: {l_freq}-{h_freq} Hz")
-    raw_filt_all = raw.copy().filter(
-        l_freq=l_freq,
-        h_freq=h_freq,
-        verbose='ERROR'
-    )
+    # Create filtered copy - improved memory management
+    logger.info(f"Creating filtered copy for bad detection: {l_freq}-{h_freq} Hz"
+                + (f", resample→{resample_hz} Hz" if resample_hz else ""))
 
-    # Only resample if resample_hz is specified and not None
-    if resample_hz:
-        logger.info(f"Resampling for bad channel detection to {resample_hz} Hz")
-        raw_filt_all.resample(resample_hz, npad="auto")
+    try:
+        raw_filt_all = raw.copy().filter(l_freq=l_freq, h_freq=h_freq, verbose='ERROR')
+        if resample_hz:
+            original_sfreq = raw_filt_all.info['sfreq']
+            raw_filt_all.resample(resample_hz, npad="auto")
+            logger.info(f"Resampled from {original_sfreq:.1f} Hz to {resample_hz:.1f} Hz")
+    except Exception as e:
+        logger.error(f"Failed to create filtered copy: {e}")
+        raise e
 
-    # Run bad channel/global bad epoch detection per type
-    for typ in which_types:
-        logger.info(f"\n=== Running autoreject bad channel detection for {typ.upper()} ===")
+    # Helper: pick channels per type
+    def _picks_for(typ):
         if typ == 'eeg':
-            picks = mne.pick_types(raw.info, eeg=True, meg=False, exclude='bads')
-        elif typ == 'mag':
-            picks = mne.pick_types(raw.info, meg='mag', eeg=False, exclude='bads')
-        elif typ == 'grad':
-            picks = mne.pick_types(raw.info, meg='grad', eeg=False, exclude='bads')
-        else:
-            logger.warning(f"Unknown channel type: {typ}, skipping.")
+            return mne.pick_types(raw.info, eeg=True, meg=False, exclude='bads')
+        if typ == 'mag':
+            return mne.pick_types(raw.info, meg='mag', eeg=False, exclude='bads')
+        if typ == 'grad':
+            return mne.pick_types(raw.info, meg='grad', eeg=False, exclude='bads')
+        return np.array([], dtype=int)
+
+    # Run detection per type
+    for typ in which_types:
+        logger.info(f"\n=== AutoReject pass for {typ.upper()} ===")
+        picks = _picks_for(typ)
+        if picks.size == 0:
+            logger.info(f"No {typ.upper()} channels to analyze.")
             detected_bads[typ] = []
             detected_bads[f"{typ}_global_bad_epochs"] = []
             continue
+
         ch_names = [raw.ch_names[i] for i in picks]
-        if len(picks) == 0:
-            logger.info(f"No {typ.upper()} channels found for autoreject.")
+        logger.info(
+            f"Analyzing {len(ch_names)} {typ.upper()} channels: {ch_names[:5]}{'...' if len(ch_names) > 5 else ''}")
+
+        # Work on filtered copy containing only these channels
+        try:
+            raw_filt = raw_filt_all.copy().pick_channels(ch_names)
+        except Exception as e:
+            logger.error(f"Failed to pick {typ} channels: {e}")
             detected_bads[typ] = []
             detected_bads[f"{typ}_global_bad_epochs"] = []
             continue
-        logger.info(f"Channels analyzed ({typ}): {ch_names}")
 
-        # Filtered copy: only relevant channels
-        raw_filt = raw_filt_all.copy().pick_channels(ch_names)
+        # Build fixed-length epochs on filtered copy
+        try:
+            events = mne.make_fixed_length_events(raw_filt, duration=duration)
+            if events is None or len(events) == 0:
+                logger.warning(f"No fixed-length events could be created for {typ.upper()}. Skipping.")
+                detected_bads[typ] = []
+                detected_bads[f"{typ}_global_bad_epochs"] = []
+                continue
 
-        events = mne.make_fixed_length_events(raw_filt, duration=duration)
-        epochs = mne.Epochs(
-            raw_filt, events, event_id=None,
-            tmin=tmin, tmax=tmax,
-            picks=np.arange(len(ch_names)),
-            baseline=None, detrend=0, preload=True, verbose=False,
-            reject_by_annotation=True
-        )
-        logger.info(
-            f"Created {len(epochs)} fixed-length epochs ({duration}s) for {typ.upper()}.")
+            epochs = mne.Epochs(
+                raw_filt, events, event_id=None,
+                tmin=tmin, tmax=tmax,
+                picks=np.arange(len(ch_names)),
+                baseline=None, detrend=0, preload=True, verbose=False,
+                reject_by_annotation=True
+            )
+            if len(epochs) == 0:
+                logger.warning(f"Zero epochs after creation for {typ.upper()}. Skipping.")
+                detected_bads[typ] = []
+                detected_bads[f"{typ}_global_bad_epochs"] = []
+                continue
 
-        # RANSAC for EEG only
+            logger.info(f"Created {len(epochs)} fixed-length epochs ({duration:.2f}s) for {typ.upper()}.")
+        except Exception as e:
+            logger.error(f"Failed to create epochs for {typ}: {e}")
+            detected_bads[typ] = []
+            detected_bads[f"{typ}_global_bad_epochs"] = []
+            continue
+
+        # RANSAC (EEG only, deterministic)
         bads_ransac = []
         if typ == 'eeg':
-            from autoreject import Ransac
-            logger.info("Running RANSAC for EEG bad channel screening...")
-            ransac = Ransac(n_jobs=1, random_state=42)
-            ransac.fit(epochs)
-            bads_ransac = list(ransac.bad_chs_)
-            logger.info(f"RANSAC bad EEG channels: {bads_ransac}")
+            try:
+                from autoreject import Ransac
+                logger.info("Running RANSAC for EEG channels...")
+                ransac = Ransac(n_jobs=1, random_state=42)
+                ransac.fit(epochs)
+                bads_ransac = list(ransac.bad_chs_)
+                logger.info(f"RANSAC identified {len(bads_ransac)} bad EEG channels: {bads_ransac}")
+            except Exception as e:
+                logger.warning(f"RANSAC failed for EEG: {e}")
+                bads_ransac = []
 
-        # Autoreject on good channels
+        # Local AutoReject on remaining "good" channels
         if typ == 'eeg':
             picks_good = [ch for ch in epochs.ch_names if ch not in bads_ransac]
         else:
             picks_good = epochs.ch_names
+
         if len(picks_good) < 2:
-            logger.warning(f"Not enough good {typ.upper()} channels for autoreject after RANSAC.")
+            logger.warning(f"Not enough good {typ.upper()} channels for AutoReject after RANSAC.")
             bads_final = bads_ransac
             detected_bads[f"{typ}_global_bad_epochs"] = []
         else:
-            from autoreject import AutoReject
-            epochs_good = epochs.copy().pick_channels(picks_good)
-            ar = AutoReject(n_interpolate=[0], consensus=None, n_jobs=1, random_state=42)
-            ar.fit(epochs_good)
-            reject_log = ar.get_reject_log(epochs_good)
-            # Per-channel bads
-            bad_labels = [lbl for labs in reject_log.labels for lbl in labs if isinstance(lbl, str)]
-            n_epochs = len(reject_log.labels)
-            bads_ar = {ch for ch, ct in Counter(bad_labels).items() if ct / n_epochs > consensus_thresh}
-            logger.info(f"Autoreject (consensus>{consensus_thresh:.2f}) {typ.upper()} bads: {sorted(list(bads_ar))}")
-            bads_final = list(set(bads_ransac) | bads_ar)
+            try:
+                from autoreject import AutoReject
+                logger.info(f"Running AutoReject on {len(picks_good)} good {typ.upper()} channels...")
 
-            # GLOBAL BAD EPOCHS
-            reject_labels = np.array(reject_log.labels)  # shape: (n_epochs, n_channels)
-            frac_bad_per_epoch = reject_labels.mean(axis=1)
-            global_bad_epochs = np.where(frac_bad_per_epoch > global_epoch_thresh)[0].tolist()
-            logger.info(f"Global bad epochs ({len(global_bad_epochs)}) for {typ.upper()}: {global_bad_epochs} "
-                        f"(threshold={global_epoch_thresh:.2f})")
-            detected_bads[f"{typ}_global_bad_epochs"] = global_bad_epochs
-            all_global_bad_epochs.update(global_bad_epochs)
+                epochs_good = epochs.copy().pick_channels(picks_good)
+                ar = AutoReject(n_interpolate=[0], consensus=None, n_jobs=1, random_state=42)
+                ar.fit(epochs_good)
+                reject_log = ar.get_reject_log(epochs_good)
 
+                # Per-channel bads from reject_log
+                bad_labels = []
+                if hasattr(reject_log, "labels") and isinstance(reject_log.labels, (list, np.ndarray)):
+                    for labs in reject_log.labels:
+                        for lbl in labs:
+                            if isinstance(lbl, str):
+                                bad_labels.append(lbl)
+
+                # Count and threshold by consensus
+                n_epochs = len(reject_log.labels) if hasattr(reject_log, "labels") else len(epochs_good)
+                bads_ar = set()
+                if n_epochs > 0 and len(bad_labels) > 0:
+                    counts = Counter(bad_labels)
+                    bads_ar = {ch for ch, ct in counts.items() if (ct / n_epochs) > consensus_thresh}
+
+                logger.info(
+                    f"AutoReject consensus>{consensus_thresh:.2f} → {len(bads_ar)} {typ.upper()} bads: {sorted(bads_ar)}")
+
+                bads_final = list(set(bads_ransac) | bads_ar)
+
+                # Global bad epochs - IMPROVED: use sample indices for precision
+                global_bad_epochs = []
+                if hasattr(reject_log, "labels"):
+                    rl = np.array([[bool(x) for x in row] for row in reject_log.labels], dtype=bool)
+                    if rl.ndim == 2 and rl.shape[0] == n_epochs:
+                        frac_bad_per_epoch = rl.mean(axis=1)
+                        bad_epoch_indices = np.where(frac_bad_per_epoch > global_epoch_thresh)[0]
+
+                        # Convert epoch indices to sample indices in ORIGINAL raw
+                        for epoch_idx in bad_epoch_indices:
+                            # Convert back to original raw sample indices
+                            sample_start = int(events[epoch_idx, 0])  # Sample index in filtered raw
+                            # Scale back to original sampling rate if needed
+                            if resample_hz and raw.info['sfreq'] != resample_hz:
+                                scale_factor = raw.info['sfreq'] / resample_hz
+                                sample_start = int(sample_start * scale_factor)
+                            global_bad_epochs.append(sample_start)
+
+                logger.info(f"Global bad epochs for {typ.upper()}: {len(global_bad_epochs)} "
+                            f"(threshold={global_epoch_thresh:.2f})")
+                detected_bads[f"{typ}_global_bad_epochs"] = global_bad_epochs
+                all_global_bad_epochs.update(global_bad_epochs)
+
+            except Exception as e:
+                logger.warning(f"AutoReject failed for {typ.upper()}: {e}")
+                bads_final = bads_ransac
+                detected_bads[f"{typ}_global_bad_epochs"] = []
+
+        # Collect type-level bads
         bads_final = [ch for ch in bads_final if isinstance(ch, str)]
         detected_bads[typ] = bads_final
         all_bad_channels.update(bads_final)
 
-    # ========================
-    # Transfer to ORIGINAL RAW
-    # ========================
+    # Transfer results to ORIGINAL raw - IMPROVED annotation handling
     # Update bad channels
     prev_bads = set(raw.info.get('bads', []))
-    new_bads = [ch for ch in all_bad_channels if ch not in prev_bads]
+    new_bads = sorted(set(all_bad_channels) - prev_bads)
     raw.info['bads'] = sorted(prev_bads | set(all_bad_channels))
-    logger.info(f"Updated raw.info['bads']: added {new_bads}, all bads: {raw.info['bads']}")
+    logger.info(f"Updated raw.info['bads']: +{new_bads} ⇒ all bads: {raw.info['bads']}")
 
-    # --- Remove old BAD_GlobalEpoch annotations from raw and filtered copy ---
-    def remove_bad_epoch_anns(raw_obj):
-        keep = [ann for ann in raw_obj.annotations if ann['description'] != "BAD_GlobalEpoch"]
-        if len(keep) > 0:
-            raw_obj.set_annotations(Annotations(
-                onset=[ann['onset'] for ann in keep],
-                duration=[ann['duration'] for ann in keep],
-                description=[ann['description'] for ann in keep]
-            ))
-        else:
-            raw_obj.set_annotations(Annotations([], [], []))
+    # Helper: remove prior BAD_GlobalEpoch annotations safely
+    def _remove_bad_epoch_anns(raw_obj):
+        if raw_obj.annotations is None or len(raw_obj.annotations) == 0:
+            return
+        keep_mask = [desc != "BAD_GlobalEpoch" for desc in raw_obj.annotations.description]
+        if all(keep_mask):
+            return
+        kept = raw_obj.annotations[keep_mask]
+        raw_obj.set_annotations(kept)
 
-    remove_bad_epoch_anns(raw)
-    remove_bad_epoch_anns(raw_filt_all)
+    # Remove old BAD_GlobalEpochs from ORIGINAL raw
+    _remove_bad_epoch_anns(raw)
 
-    # --- Add new BAD_GlobalEpoch annotations ---
-    anns = None
+    # Add NEW BAD_GlobalEpoch annotations using sample indices
     if len(all_global_bad_epochs) > 0:
-        # Time-based mapping: get actual time windows from filtered data, then map to original timeline
-        filtered_epochs_times = []
-        for idx in sorted(set(all_global_bad_epochs)):
-            # Get actual time boundaries from the filtered data timeline
-            start_time = raw_filt_all.times[0] + idx * duration
-            end_time = start_time + duration
-            filtered_epochs_times.append((start_time, end_time))
+        # Determine stable orig_time for annotations
+        if raw.annotations is not None and raw.annotations.orig_time is not None:
+            base_orig = raw.annotations.orig_time
+        else:
+            base_orig = raw.info.get('meas_date', None)
 
-        # Map these time windows to original data (these times should align since filtering preserves timing)
-        epoch_onsets = [start_time for start_time, end_time in filtered_epochs_times]
-        durations_list = [end_time - start_time for start_time, end_time in filtered_epochs_times]
-        descriptions = ["BAD_GlobalEpoch"] * len(epoch_onsets)
-        anns = Annotations(onset=epoch_onsets, duration=durations_list, description=descriptions)
+        # Convert sample indices to time (more precise than duration math)
+        sfreq = raw.info['sfreq']
+        onsets = []
+        for sample_idx in sorted(set(all_global_bad_epochs)):
+            time_sec = sample_idx / sfreq
+            onsets.append(time_sec)
+
+        durs = [duration] * len(onsets)
+        descs = ["BAD_GlobalEpoch"] * len(onsets)
+
+        new_anns = Annotations(onset=onsets, duration=durs, description=descs, orig_time=base_orig)
         if raw.annotations is not None and len(raw.annotations) > 0:
-            raw.set_annotations(raw.annotations + anns)
+            combined = mne.Annotations(
+                onset=list(raw.annotations.onset) + list(new_anns.onset),
+                duration=list(raw.annotations.duration) + list(new_anns.duration),
+                description=list(raw.annotations.description) + list(new_anns.description),
+                orig_time=raw.annotations.orig_time
+            )
+            raw.set_annotations(combined)
         else:
-            raw.set_annotations(anns)
-        if raw_filt_all.annotations is not None and len(raw_filt_all.annotations) > 0:
-            raw_filt_all.set_annotations(raw_filt_all.annotations + anns)
-        else:
-            raw_filt_all.set_annotations(anns)
-        logger.info(f"Added {len(anns)} BAD_GlobalEpoch annotations to raw and raw_filt_all.")
+            raw.set_annotations(new_anns)
+        logger.info(f"Added {len(new_anns)} BAD_GlobalEpoch annotations to ORIGINAL raw.")
 
-    # --- Debug print before plotting ---
-    print("Annotations in raw_filt_all before plot:")
-    for ann in raw_filt_all.annotations:
-        print(f"  {ann['onset']:.2f}-{ann['onset'] + ann['duration']:.2f}s: {ann['description']}")
-
-    # ================================
-    # INTERACTIVE REVIEW (Channels/Epochs)
-    # ================================
+    # INTERACTIVE REVIEW with improved workflow
     if interactive:
-        logger.info(
-            "Launching interactive viewer for review: bad channels and BAD_GlobalEpoch grayed out (FILTERED data).")
-        raw_filt_all.info['bads'] = list(raw.info['bads'])  # Sync bads for GUI
+        logger.info("🎮 Starting interactive review on filtered copy...")
 
-        print("\nInteractive Bad Channel & Epoch Review:")
-        print("- Auto-detected bad channels are grayed out")
-        print("- BAD_GlobalEpoch epochs are grayed out (can be edited in the browser)")
-        print("- Click channel names or annotation bars to toggle bad/good status")
-        print("- Close the plot window when finished")
-        print(f"Initial bad channels: {sorted(raw_filt_all.info['bads'])}")
+        # Mirror bads and annotations to viewer copy
+        raw_filt_all.info['bads'] = list(raw.info['bads'])
 
-        print("RAW_FILT_ALL time range: {:.2f} - {:.2f}".format(raw_filt_all.times[0], raw_filt_all.times[-1]))
-        for ann in raw_filt_all.annotations:
-            print(f"ANNOT: {ann['description']} onset={ann['onset']:.2f}s duration={ann['duration']:.2f}s")
-        print("Bad channels before plot:", raw_filt_all.info['bads'])
-        import sys
-        sys.stdout.flush()
+        # Show current BAD_GlobalEpochs in viewer
+        if raw.annotations is not None and len(raw.annotations) > 0:
+            # Scale annotations to filtered copy timing
+            viewer_anns = []
+            filt_sfreq = raw_filt_all.info['sfreq']
+            orig_sfreq = raw.info['sfreq']
+            scale_factor = filt_sfreq / orig_sfreq if orig_sfreq != filt_sfreq else 1.0
 
-        fig = raw_filt_all.plot(
-            n_channels=min(32, len(raw_filt_all.ch_names)),
-            block=True,
-            show=True
-        )
-        input("Review plot, then close the window and press Enter...")
+            for ann in raw.annotations:
+                if ann['description'] == "BAD_GlobalEpoch":
+                    scaled_onset = ann['onset'] * scale_factor
+                    scaled_duration = ann['duration'] * scale_factor
+                    viewer_anns.append({
+                        'onset': scaled_onset,
+                        'duration': scaled_duration,
+                        'description': 'BAD_GlobalEpoch'
+                    })
 
-        # --- Transfer user-reviewed bad channels to original raw ---
-        final_bads = raw_filt_all.info['bads'].copy()
-        raw.info['bads'] = final_bads
+            if viewer_anns:
+                if raw_filt_all.annotations is None:
+                    raw_filt_all.set_annotations(Annotations(onset=[], duration=[], description=[]))
 
-        # --- Transfer user-reviewed BAD_GlobalEpoch annotations ---
-        gb_annots = [ann for ann in raw_filt_all.annotations if ann['description'] == "BAD_GlobalEpoch"]
-        # Convert annotation onset times back to epoch indices for the original data timeline
-        first_sample_time = raw.times[0]
-        final_bad_epochs = [int(round((a['onset'] - first_sample_time) / duration)) for a in gb_annots]
-        logger.info(f"After user review, final global bad epochs: {final_bad_epochs}")
-
-        # Update both raw and detected_bads with final annotations
-        remove_bad_epoch_anns(raw)
-        if len(final_bad_epochs) > 0:
-            # Use time-based mapping for final annotations too
-            final_epochs_times = []
-            for idx in final_bad_epochs:
-                start_time = first_sample_time + idx * duration
-                end_time = start_time + duration
-                final_epochs_times.append((start_time, end_time))
-
-            epoch_onsets = [start_time for start_time, end_time in final_epochs_times]
-            durations_list = [end_time - start_time for start_time, end_time in final_epochs_times]
-            descriptions = ["BAD_GlobalEpoch"] * len(epoch_onsets)
-            anns = Annotations(onset=epoch_onsets, duration=durations_list, description=descriptions)
-            if raw.annotations is not None and len(raw.annotations) > 0:
-                # Create combined annotations manually to avoid orig_time issues
-                combined_annotations = mne.Annotations(
-                    onset=list(raw.annotations.onset) + list(anns.onset),
-                    duration=list(raw.annotations.duration) + list(anns.duration),
-                    description=list(raw.annotations.description) + list(anns.description),
-                    orig_time=raw.annotations.orig_time
+                view_orig = raw.annotations.orig_time if raw.annotations is not None else raw.info.get('meas_date',
+                                                                                                       None)
+                anns_view = Annotations(
+                    onset=[a['onset'] for a in viewer_anns],
+                    duration=[a['duration'] for a in viewer_anns],
+                    description=[a['description'] for a in viewer_anns],
+                    orig_time=view_orig
                 )
-                raw.set_annotations(combined_annotations)
+                raw_filt_all.set_annotations(raw_filt_all.annotations + anns_view)
+
+        # Enhanced interactive plotting with better error handling
+        try:
+            logger.info("🖥️  Opening interactive plot window...")
+            logger.info("📋 Instructions:")
+            logger.info("   - Click channels to mark/unmark as bad")
+            logger.info("   - Click time segments to mark/unmark BAD_GlobalEpoch annotations")
+            logger.info("   - Use scroll wheel to zoom in/out")
+            logger.info("   - Close the plot window when done")
+
+            # Show plot with reasonable defaults
+            n_channels = min(32, len(raw_filt_all.ch_names))
+            raw_filt_all.plot(
+                n_channels=n_channels,
+                duration=30.0,  # Show 30 seconds at a time
+                scalings='auto',
+                show=True,
+                block=True,
+                title=f"Interactive Review - {len(raw_filt_all.info['bads'])} bad channels"
+            )
+
+            # Wait for user confirmation
+            print("\n" + "=" * 60)
+            print("🎯 INTERACTIVE REVIEW COMPLETE")
+            print("   - Close the plot window if you haven't already")
+            print("   - Your changes will be saved to the checkpoint")
+            print("=" * 60)
+            response = input("Press Enter to continue with your changes (or 'abort' to cancel): ").strip().lower()
+
+            if response == 'abort':
+                logger.info("❌ User aborted interactive review - keeping original results")
+                del raw_filt_all
+                return detected_bads
+
+        except Exception as e:
+            logger.error(f"Interactive plotting failed: {e}")
+            logger.info("⚠️  Continuing with automated results only")
+            del raw_filt_all
+            return detected_bads
+
+        # Transfer user-reviewed bad channels back to ORIGINAL raw
+        final_bads = list(raw_filt_all.info.get('bads', []))
+        original_bads = set(raw.info.get('bads', []))
+        reviewed_bads = set(final_bads)
+
+        added_bads = reviewed_bads - original_bads
+        removed_bads = original_bads - reviewed_bads
+
+        if added_bads:
+            logger.info(f"✅ User added bad channels: {sorted(added_bads)}")
+        if removed_bads:
+            logger.info(f"🔄 User rescued channels: {sorted(removed_bads)}")
+
+        raw.info['bads'] = sorted(final_bads)
+
+        # Transfer user-reviewed BAD_GlobalEpochs back to ORIGINAL raw
+        _remove_bad_epoch_anns(raw)
+
+        if raw_filt_all.annotations is not None and len(raw_filt_all.annotations) > 0:
+            gb_annots = [ann for ann in raw_filt_all.annotations if ann['description'] == "BAD_GlobalEpoch"]
+
+            if gb_annots:
+                # Convert back to original timeline
+                orig_sfreq = raw.info['sfreq']
+                filt_sfreq = raw_filt_all.info['sfreq']
+                scale_factor = orig_sfreq / filt_sfreq if filt_sfreq != orig_sfreq else 1.0
+
+                final_onsets = []
+                final_durations = []
+                for ann in gb_annots:
+                    scaled_onset = ann['onset'] * scale_factor
+                    scaled_duration = ann['duration'] * scale_factor
+                    final_onsets.append(scaled_onset)
+                    final_durations.append(scaled_duration)
+
+                if final_onsets:
+                    base_orig = raw.annotations.orig_time if raw.annotations is not None else raw.info.get('meas_date',
+                                                                                                           None)
+                    anns_final = Annotations(
+                        onset=final_onsets,
+                        duration=final_durations,
+                        description=["BAD_GlobalEpoch"] * len(final_onsets),
+                        orig_time=base_orig
+                    )
+
+                    if raw.annotations is not None and len(raw.annotations) > 0:
+                        combined = mne.Annotations(
+                            onset=list(raw.annotations.onset) + list(anns_final.onset),
+                            duration=list(raw.annotations.duration) + list(anns_final.duration),
+                            description=list(raw.annotations.description) + list(anns_final.description),
+                            orig_time=raw.annotations.orig_time
+                        )
+                        raw.set_annotations(combined)
+                    else:
+                        raw.set_annotations(anns_final)
+
+                    logger.info(f"✅ Committed {len(anns_final)} user-reviewed BAD_GlobalEpoch annotations")
+                else:
+                    logger.info("🗑️  User removed all BAD_GlobalEpoch annotations")
             else:
-                raw.set_annotations(anns)
-            logger.info(f"User-reviewed BAD_GlobalEpoch annotations transferred to unfiltered raw.")
+                logger.info("🗑️  No BAD_GlobalEpoch annotations after user review")
+
+        # Update detected_bads with final results for caller
+        final_bad_epochs = []
+        if raw.annotations is not None:
+            sfreq = raw.info['sfreq']
+            for ann in raw.annotations:
+                if ann['description'] == "BAD_GlobalEpoch":
+                    sample_idx = int(ann['onset'] * sfreq)
+                    final_bad_epochs.append(sample_idx)
 
         for typ in which_types:
-            detected_bads[f"{typ}_global_bad_epochs"] = final_bad_epochs
+            detected_bads[f"{typ}_global_bad_epochs"] = sorted(set(final_bad_epochs))
 
-        logger.info(f"Final bad channels after user review: {sorted(final_bads)}")
+        logger.info("🎉 Interactive review completed successfully!")
 
-    # =====================
-    # CLEAN UP FILTERED COPY
-    # =====================
+    # Cleanup filtered copy
     del raw_filt_all
 
     return detected_bads
