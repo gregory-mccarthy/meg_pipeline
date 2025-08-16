@@ -32,13 +32,37 @@ import argparse
 import logging
 from pathlib import Path
 from datetime import datetime, timezone
-import meg_pipeline_utils as utils
 
 import mne
 import json
 import numpy as np
 import matplotlib
-matplotlib.use('QtAgg')
+# Choose an interactive backend when a display is available; fall back to Agg in headless/SLURM
+def _in_slurm() -> bool:
+    return any(k in os.environ for k in ("SLURM_JOB_ID", "SLURM_JOB_NAME", "SLURM_SUBMIT_DIR"))
+
+def _has_display() -> bool:
+    # On macOS, a window server is present when running locally.
+    if sys.platform.startswith("darwin"):
+        return True
+    # On Linux (e.g., OOD), DISPLAY or WAYLAND_DISPLAY indicates a GUI session
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+# Allow an explicit override if you ever need it:
+_override = os.environ.get("MPLBACKEND_OVERRIDE") or os.environ.get("MPLBACKEND")
+
+if _override:
+    matplotlib.use(_override, force=True)
+elif _in_slurm() or not _has_display():
+    matplotlib.use("Agg", force=True)   # headless: no interactive windows
+else:
+    matplotlib.use("QtAgg", force=True) # interactive (Mac, OOD desktop)
+
+# ---------- utils import (support v3 or v2) ----------
+try:
+    import meg_pipeline_utils_v3 as utils
+except ImportError:
+    import meg_pipeline_utils as utils
 
 # ---------- optional transfer manager (only used in hybrid) ----------
 try:
