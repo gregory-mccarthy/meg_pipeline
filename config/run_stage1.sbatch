@@ -3,20 +3,15 @@
 #SBATCH --output=logs/meg_stage1_%j.out
 #SBATCH --error=logs/meg_stage1_%j.err
 #SBATCH --time=04:00:00
-#SBATCH --partition=general
+#SBATCH --partition=day
 #SBATCH --account=mccarthy
 #SBATCH --qos=normal
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 
-# If your site uses modules for conda:
-module load miniconda 2>/dev/null || true
+mkdir -p logs
 
-# Activate your environment
-source ~/anaconda3/etc/profile.d/conda.sh 2>/dev/null || source ~/miniconda3/etc/profile.d/conda.sh 2>/dev/null || true
-conda activate mne
-
-# Headless-safe matplotlib (Stage 1 is non-interactive anyway)
+# Headless-safe matplotlib (Stage 1 is non-interactive)
 export MPLBACKEND=Agg
 
 # Make NumPy/BLAS respect SLURM CPU request
@@ -25,5 +20,12 @@ export MKL_NUM_THREADS=$SLURM_CPUS_PER_TASK
 export OPENBLAS_NUM_THREADS=$SLURM_CPUS_PER_TASK
 export NUMEXPR_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
-# Run STAGE 1 only (write checkpoint + exit)
-srun python preprocess_meg.py config/preprroc_params_epi_SLURM.yaml --force-stage stage1
+# Use your exact Python
+PY=/home/gm33/.conda/envs/mne/bin/python
+
+# Sanity checks in logs
+$PY -c "import sys; print('Python:', sys.executable); print('Version:', sys.version)"
+$PY -c "import mne; print('MNE:', mne.__version__)"
+
+# Stage 1 only (writes checkpoint then exits)
+srun $PY preprocess_meg.py config/preproc_params_epi_SLURM.yml --force-stage stage1
