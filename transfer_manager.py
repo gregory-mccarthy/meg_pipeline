@@ -114,30 +114,72 @@ class HybridTransferManager:
     def push_results(self, local_bids_root: str, remote_bids_root: str,
                      subject: str, session: Optional[str]) -> int:
         """
-        Push all derivatives back to HPC in single transfer.
-        """
+        Push ALL changes back to HPC in single transfer:
+        - New derivatives (preprocessing results)
+        - New sidecar files (headpos.pos, etc.) in raw data directories
+        - Any other files created during processing
 
+        Uses complex rsync with includes to sync entire BIDS structure efficiently.
+        """
+        local_bids_path = Path(local_bids_root)
+        if not local_bids_path.exists():
+            logger.warning(f"Local BIDS root doesn't exist: {local_bids_root}")
+            return 1
+
+        # Build directory patterns for this subject
         rel_dir = f"sub-{subject}"
         if session:
             rel_dir += f"/ses-{session}"
 
-        local_deriv_path = Path(local_bids_root) / "derivatives" / "preprocessing" / rel_dir / "meg"
-        remote_deriv_path = f"{self.remote_prefix}:{remote_bids_root}/derivatives/preprocessing/{rel_dir}/"
+        # FIXED: Build includes to only sync THIS subject's data, even if temp/BIDS has other subjects
+        includes = []
 
-        if not local_deriv_path.exists():
-            logger.warning(f"No derivatives to push: {local_deriv_path}")
-            return 1
+        # 1. Subject-specific directory structure only
+        includes.extend([
+            f"sub-{subject}/",
+            f"sub-{subject}/ses-{session}/" if session else "",
+            f"sub-{subject}/ses-{session}/meg/" if session else f"sub-{subject}/meg/",
+        ])
 
-        # Push meg directory contents to remote meg directory
-        # Note: trailing slash on source syncs contents, not the directory itself
+        # 2. Subject-specific derivatives structure only
+        includes.extend([
+            "derivatives/",
+            "derivatives/preprocessing/",
+            f"derivatives/preprocessing/sub-{subject}/",
+            f"derivatives/preprocessing/sub-{subject}/ses-{session}/" if session else "",
+            f"derivatives/preprocessing/sub-{subject}/ses-{session}/meg/" if session else f"derivatives/preprocessing/sub-{subject}/meg/",
+        ])
+
+        # 3. ONLY this subject's raw data files (not other subjects)
+        raw_pattern = f"sub-{subject}/ses-{session}/meg/**" if session else f"sub-{subject}/meg/**"
+        includes.append(raw_pattern)
+
+        # 4. ONLY this subject's derivatives (not other subjects)
+        deriv_pattern = f"derivatives/preprocessing/sub-{subject}/**"
+        includes.append(deriv_pattern)
+
+        # Remove empty strings from includes
+        includes = [inc for inc in includes if inc]
+
+        # Create remote BIDS root and execute rsync with includes
+        remote_target = f"{self.remote_prefix}:{remote_bids_root}/"
+
         cmd = [
-            "rsync", "-avz", "--progress",
-            "--partial",
-            str(local_deriv_path) + "/",  # Trailing slash = sync contents
-            remote_deriv_path + "meg/"  # Into the meg directory
+            "rsync", "-avz", "--progress", "--partial",
+            "--rsync-path", f"mkdir -p {remote_bids_root} && rsync"
         ]
 
-        logger.info(f"Pushing results: {' '.join(shlex.quote(arg) for arg in cmd)}")
+        # Add all include patterns
+        for pattern in includes:
+            cmd.extend(["--include", pattern])
+
+        # Exclude everything else
+        cmd.extend(["--exclude", "*"])
+
+        # Add source and destination
+        cmd.extend([str(local_bids_path) + "/", remote_target])
+
+        logger.info(f"Pushing all BIDS changes: {' '.join(shlex.quote(arg) for arg in cmd)}")
         return subprocess.call(cmd)
 
     def _rsync_with_includes(self, src: str, dst: str, includes: List[str]) -> int:
