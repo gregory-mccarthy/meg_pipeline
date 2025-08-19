@@ -885,7 +885,16 @@ def find_bad_channels_autoreject_by_type_improved(
                 logger.info(f"Running AutoReject on {len(picks_good)} good {typ.upper()} channels...")
 
                 epochs_good = epochs.copy().pick_channels(picks_good)
-                ar = AutoReject(n_interpolate=[0], consensus=None, n_jobs=1, random_state=42)
+                # Get AutoReject configuration parameters
+                ar_cfg = cfg.get("autoreject", {})
+                ar = AutoReject(
+                    n_interpolate=ar_cfg.get("n_interpolate", [0]),
+                    cv=ar_cfg.get("cv_folds", 5),
+                    thresh_method=ar_cfg.get("thresh_method", "random_search"),
+                    consensus=None,
+                    n_jobs=1,
+                    random_state=42
+                )
                 ar.fit(epochs_good)
                 reject_log = ar.get_reject_log(epochs_good)
 

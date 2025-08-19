@@ -259,9 +259,10 @@ def run_stage1_pipeline(yaml_path: str, p: dict):
     # ---------------- 9. AutoReject + checkpoint ----------------
     utils.log_section("9. Bad Channel Detection with AutoReject (checkpoint)")
     ar_cfg = p.get("autoreject", {})
+
     if not ar_cfg.get("enabled", True):
-        logger.error("AutoReject disabled — Stage 2 cannot proceed properly")
-        return ('exit', raw)
+        logger.info("AutoReject disabled — skipping bad channel detection")
+        # But still write checkpoint with all the other Stage 1 processing
 
     p["_checkpoint_version"] = CHECKPOINT_VERSION
     try:
@@ -273,13 +274,13 @@ def run_stage1_pipeline(yaml_path: str, p: dict):
             logger.info("✅ Stage 1 completed — checkpoint saved")
             return ('continue', raw)
     except Exception as e:
-        logger.error(f"AutoReject checkpoint failed: {e}")
-        resp = input("AutoReject failed. Continue without bad channel detection? (y/n): ").strip().lower()
+        logger.error(f"Checkpoint writing failed: {e}")
+        resp = input("Checkpoint failed. Continue without checkpoint? (y/n): ").strip().lower()
         if resp != 'y': return ('exit', raw)
-        logger.warning("Continuing without AutoReject")
+        logger.warning("Continuing without checkpoint")
+
     logger.error("Unexpected Stage 1 flow")
     return ('exit', raw)
-
 
 # ==========================================================
 # STAGE 2 (unchanged core; loads checkpoint and completes)
@@ -319,10 +320,14 @@ def run_stage2_pipeline(yaml_path: str, p: dict, checkpoint_path: Path):
     # 9b. Interactive review (no recompute)
     utils.log_section("9b. Interactive Review (no AR recompute)")
     ar_cfg = p.get("autoreject", {})
-    if ar_cfg.get("enabled", True) and p.get("interactive_bad_channels", True):
+    if p.get("interactive_bad_channels", True):
+        # Always offer interactive review if interactive_bad_channels is True
+        # regardless of whether AutoReject was enabled in Stage 1
         status, raw = utils.run_autoreject_with_checkpoint(raw, p, bids_path, logger)
         if status != 'continue':
             logger.warning(f"Unexpected status from interactive review: {status}")
+    else:
+        logger.info("Interactive review disabled - proceeding with current bad channels")
 
     # 9c. Rank (optional)
     utils.log_section("9c. Estimate MEG Rank")
