@@ -11,6 +11,7 @@ import numpy as np
 from autoreject import Ransac, AutoReject
 import logging
 from collections import Counter
+from scipy.stats import kurtosis
 
 # Logging and version global
 logger = logging.getLogger("pipeline")
@@ -134,12 +135,12 @@ def get_and_check_path(cfg_dict, key, repo_root, description="file"):
         raise FileNotFoundError(f"{description.capitalize()} not found: {resolved}")
     return resolved
 
-def check_critical_files_exist(config, repo_root):
+def check_critical_files_exist(cfg, repo_root):  # CHANGED: config -> cfg
     files_to_check = [
         # Each item: (dict, key, description)
-        (config.get("eeg_handling", {}), "montage", "montage file"),
-        (config, "calibration_file", "MEG calibration file"),
-        (config, "cross_talk_file", "MEG crosstalk file"),
+        (cfg.get("eeg_handling", {}), "montage", "montage file"),     # CHANGED: config -> cfg
+        (cfg, "calibration_file", "MEG calibration file"),           # CHANGED: config -> cfg
+        (cfg, "cross_talk_file", "MEG crosstalk file"),              # CHANGED: config -> cfg
         # Add more as needed
     ]
     checked_paths = {}
@@ -158,69 +159,47 @@ def get_bids_headpos_path(subject, session, task, run, meg_dir):
     fname += "_headpos.pos"
     return os.path.join(meg_dir, fname)
 
-# ---------- FIXED CHECKPOINTED AUTOREJECT WRAPPER ----------
-def run_autoreject_with_checkpoint(raw, cfg, bids_path, logger):
-    """
-    Split autoreject into Stage 1 (non-interactive) and Stage 2 (interactive review only).
 
-    DESIGN:
-    - Stage 1: Non-interactive AutoReject, writes checkpoint (parproc + manifest), returns
-    - Stage 2: Load checkpoint, run *interactive* review only (no recompute), update checkpoint, return
+# ========== CLEAN SPLIT: Two separate AutoReject functions ==========
+
+def run_autoreject_stage1(raw, cfg, bids_path, logger):
+    """
+    Stage 1: Run AutoReject headlessly (non-interactive) and save checkpoint.
+
+    This function:
+    - Runs RANSAC + AutoReject on filtered/downsampled copy
+    - Updates bad channels and annotations on original raw object
+    - Saves checkpoint FIF file
+    - Returns metadata for manifest writing
+
+    Args:
+        raw: MNE Raw object (will be modified in-place)
+        cfg: Configuration dictionary
+        bids_path: BIDS path object
+        logger: Logger instance
 
     Returns:
-        ('continue', raw_like) on success,
-        ('exit', raw_like) if configured to stop after Stage 1 (exit_after_checkpoint=True).
+        tuple: (checkpoint_path, stage1_metadata)
     """
-    import hashlib
     from pathlib import Path
-    import datetime
-    import mne
-    from mne.annotations import Annotations
-    import numpy as np
 
-    # ---- Resolve checkpoint config with safe defaults
+    # Get configuration
     chk_cfg = cfg.get("checkpoint", {})
-    enabled = chk_cfg.get("enabled", True)
-    exit_after = chk_cfg.get("exit_after_checkpoint", False)
+    ar_cfg = cfg.get("autoreject", {})
 
+    if not chk_cfg.get("enabled", True):
+        logger.info("[AR Stage 1] Checkpointing disabled - skipping AutoReject")
+        return (None, {"autoreject_skipped": True})
+
+    if not ar_cfg.get("enabled", True):
+        logger.info("[AR Stage 1] AutoReject disabled - will save checkpoint without AR processing")
+
+    # Build checkpoint path
+    bids_root = Path(cfg.get("bids_root", bids_path.root))
     derivatives_root = chk_cfg.get("derivatives_root", "derivatives")
     pipeline_name = chk_cfg.get("pipeline_name", "preprocessing")
-
-    atomic_writes = chk_cfg.get("atomic_writes", True)
-    allow_yaml_diff = chk_cfg.get("allow_resume_with_different_yaml", False)
-    validate_integrity = chk_cfg.get("validate_checkpoint_integrity", True)
-    backup_before_overwrite = chk_cfg.get("backup_before_overwrite", False)
-
-    # Get interactive setting from main config
-    interactive_bad_channels = cfg.get("interactive_bad_channels", True)
-
-    if not enabled:
-        logger.info("[checkpoint] Disabled in YAML; falling back to original interactive AR path.")
-        # When checkpointing is disabled, run the old way
-        ar_cfg = cfg.get("autoreject", {})
-        ar_types = ar_cfg.get("which_types", ['eeg', 'mag', 'grad'])
-        fset = ar_cfg.get("filter", {'highpass': 1.0, 'lowpass': 40.0, 'resample_hz': None})
-        eset = ar_cfg.get("epoch", {'duration': 2.0, 'tmin': 0.0, 'tmax': 2.0})
-        consensus_thresh = ar_cfg.get("consensus_thresh", 0.3)
-        global_epoch_thresh = ar_cfg.get("global_epoch_thresh", 0.3)
-        bads_dict = find_bad_channels_autoreject_by_type_improved(
-            raw,
-            which_types=ar_types,
-            filter_settings=fset,
-            epoch_settings=eset,
-            consensus_thresh=consensus_thresh,
-            global_epoch_thresh=global_epoch_thresh,
-            interactive=interactive_bad_channels,
-            logger=logger
-        )
-        logger.info(f"[checkpoint] (disabled) AR result: {bads_dict}; bads={raw.info.get('bads', [])}")
-        return ('continue', raw)
-
-    # ---- Build paths (respect current bids_root)
-    bids_root = Path(cfg.get("bids_root", bids_path.root))
     deriv_root = bids_root / derivatives_root / pipeline_name
 
-    # Build proper subject/session directory structure
     subject_dir = f"sub-{bids_path.subject}"
     if bids_path.session:
         session_dir = f"ses-{bids_path.session}"
@@ -229,7 +208,6 @@ def run_autoreject_with_checkpoint(raw, cfg, bids_path, logger):
         parproc_dir = deriv_root / subject_dir / "meg"
     parproc_dir.mkdir(parents=True, exist_ok=True)
 
-    # Build checkpoint filename
     base_name = f"sub-{bids_path.subject}"
     if bids_path.session:
         base_name += f"_ses-{bids_path.session}"
@@ -238,289 +216,278 @@ def run_autoreject_with_checkpoint(raw, cfg, bids_path, logger):
     if bids_path.run:
         base_name += f"_run-{bids_path.run}"
 
-    parproc_fif = parproc_dir / f"{base_name}_desc-parproc_meg.fif"
-    manifest_path = parproc_fif.with_name(parproc_fif.stem + "_manifest.yaml")
+    checkpoint_path = parproc_dir / f"{base_name}_desc-parproc_meg.fif"
 
-    # ---- Helpers
-    def _atomic_save_fif(raw_obj, out_path: Path):
-        """Write FIF atomically by using temporary file with .fif extension (MNE warns about naming; harmless)."""
-        if not atomic_writes:
-            raw_obj.save(str(out_path), overwrite=True)
-            return
+    # Run AutoReject if enabled
+    ar_metadata = {}
+    if ar_cfg.get("enabled", True):
+        logger.info("[AR Stage 1] Running non-interactive AutoReject...")
 
-        if backup_before_overwrite and out_path.exists():
-            backup_path = out_path.with_suffix(out_path.suffix + ".backup")
-            import shutil
-            shutil.copy2(out_path, backup_path)
-            logger.info(f"[checkpoint] Created backup: {backup_path}")
-
-        tmp = out_path.with_name(out_path.stem + "_tmp.fif")
-        try:
-            raw_obj.save(str(tmp), overwrite=True)
-            tmp.replace(out_path)
-            logger.info(f"[checkpoint] Saved to: {out_path}")
-        finally:
-            if tmp.exists():
-                try:
-                    tmp.unlink()
-                except Exception:
-                    pass
-
-    def _yaml_sha256(yaml_text: str) -> str:
-        return hashlib.sha256(yaml_text.encode("utf-8")).hexdigest()
-
-    def _build_manifest(stage, extra=None, current_yaml_hash=None, prior_yaml_hash=None):
-        """Build manifest dictionary with metadata and (optionally) both YAML hashes."""
-        yaml_text = None
-        try:
-            yaml_path_local = cfg.get("_cfg_path", "")
-            if yaml_path_local and Path(yaml_path_local).exists():
-                yaml_text = Path(yaml_path_local).read_text()
-        except Exception as e:
-            logger.warning(f"Could not read YAML for manifest: {e}")
-
-        man = {
-            "created_utc": datetime.datetime.utcnow().isoformat() + "Z",
-            "stage": stage,
-            "pipeline_version": "1.2",
-            "checkpoint_version": cfg.get("_checkpoint_version", "1.0"),
-            "exit_after_checkpoint": exit_after,
-            "inputs": {
-                "bids": {
-                    "subject": bids_path.subject,
-                    "session": bids_path.session,
-                    "task": bids_path.task,
-                    "run": bids_path.run,
-                },
-                "bids_root": str(bids_root),
-                "yaml_path": cfg.get("_cfg_path", None),
-                "yaml_sha256": _yaml_sha256(yaml_text) if yaml_text else None,
-                # audit fields (optional)
-                "yaml_sha256_current": current_yaml_hash,
-                "yaml_sha256_prior": prior_yaml_hash,
-            },
-            "artifacts": {
-                "parproc_raw_fif": str(parproc_fif),
-                "manifest_path": str(manifest_path),
-            },
-            "params": {
-                "autoreject": cfg.get("autoreject", {}),
-                "checkpoint": chk_cfg,
-                "interactive_bad_channels": interactive_bad_channels,
-            },
-            "environment": get_runtime_info(),
-        }
-        if extra:
-            man.update(extra)
-        return man
-
-    def _validate_checkpoint_integrity(raw_obj, manifest_data):
-        try:
-            if len(raw_obj.ch_names) == 0:
-                raise ValueError("No channels in checkpoint data")
-            if raw_obj.times[-1] <= 0:
-                raise ValueError("Invalid recording duration")
-            bads = raw_obj.info.get('bads', [])
-            invalid_bads = [ch for ch in bads if ch not in raw_obj.ch_names]
-            if invalid_bads:
-                raise ValueError(f"Invalid bad channels: {invalid_bads}")
-            logger.info("[checkpoint] ✅ Checkpoint integrity validation passed")
-            return True
-        except Exception as e:
-            logger.error(f"[checkpoint] ❌ Checkpoint integrity validation failed: {e}")
-            return False
-
-    def _run_interactive_review_only(raw_obj, ar_cfg, logger):
-        """Run ONLY the interactive review; no AR recompute."""
-        logger.info("[checkpoint] Opening interactive review (no re-computation)")
-        fset = ar_cfg.get("filter", {'highpass': 1.0, 'lowpass': 40.0, 'resample_hz': None})
-        l_freq = float(fset.get('highpass', 1.0))
-        h_freq = float(fset.get('lowpass', 40.0))
-        resample_hz = fset.get('resample_hz')
-
-        logger.info(f"Creating filtered copy for interactive viewing: {l_freq}-{h_freq} Hz")
-        raw_filt = raw_obj.copy().filter(l_freq=l_freq, h_freq=h_freq, verbose='ERROR')
-        if resample_hz:
-            raw_filt.resample(float(resample_hz), npad="auto")
-
-        raw_filt.info['bads'] = list(raw_obj.info.get('bads', []))
-        if raw_obj.annotations is not None:
-            raw_filt.set_annotations(raw_obj.annotations)
-
-        original_bads = set(raw_obj.info.get('bads', []))
-        original_annots_count = len(raw_obj.annotations) if raw_obj.annotations else 0
-
-        logger.info("🎮 Opening interactive review window...")
-        logger.info(f"   Current bad channels: {len(original_bads)}")
-        logger.info(f"   Current annotations: {original_annots_count}")
-
-        try:
-            n_channels = min(32, len(raw_filt.ch_names))
-            raw_filt.plot(
-                n_channels=n_channels,
-                duration=30.0,
-                scalings='auto',
-                show=True,
-                block=True,
-                title=f"Interactive Review - {len(raw_filt.info['bads'])} bad channels"
-            )
-            response = input("Press Enter to keep changes (or 'abort' to cancel): ").strip().lower()
-            if response == 'abort':
-                logger.info("❌ User aborted interactive review - keeping original")
-                del raw_filt
-                return raw_obj
-        except Exception as e:
-            logger.error(f"Interactive plotting failed: {e}")
-            del raw_filt
-            return raw_obj
-
-        # Transfer changes back
-        reviewed_bads = set(raw_filt.info.get('bads', []))
-        added_bads = reviewed_bads - original_bads
-        removed_bads = original_bads - reviewed_bads
-        if added_bads:
-            logger.info(f"✅ User added bad channels: {sorted(added_bads)}")
-        if removed_bads:
-            logger.info(f"🔄 User rescued channels: {sorted(removed_bads)}")
-
-        raw_obj.info['bads'] = sorted(reviewed_bads)
-
-        if raw_filt.annotations is not None and len(raw_filt.annotations) > 0:
-            raw_obj.set_annotations(raw_filt.annotations)
-            logger.info(f"✅ Updated annotations: {len(raw_filt.annotations)} total")
-
-        del raw_filt
-        logger.info("🎉 Interactive review completed!")
-        return raw_obj
-
-    # ---- Detect existing checkpoint
-    checkpoint_exists = parproc_fif.exists() and manifest_path.exists()
-
-    # ========================================================================
-    # STAGE 1: Non-interactive AutoReject and checkpoint (when NO checkpoint exists)
-    # ========================================================================
-    if not checkpoint_exists:
-        logger.info("[checkpoint] Stage 1: non-interactive AutoReject")
-
-        # Get AutoReject parameters
-        ar_cfg = cfg.get("autoreject", {})
+        # Get AR parameters
         ar_types = ar_cfg.get("which_types", ['eeg', 'mag', 'grad'])
         fset = ar_cfg.get("filter", {'highpass': 1.0, 'lowpass': 40.0, 'resample_hz': None})
         eset = ar_cfg.get("epoch", {'duration': 2.0, 'tmin': 0.0, 'tmax': 2.0})
         consensus_thresh = ar_cfg.get("consensus_thresh", 0.3)
         global_epoch_thresh = ar_cfg.get("global_epoch_thresh", 0.3)
 
-        # Run non-interactive AR
-        bads_dict = find_bad_channels_autoreject_by_type_improved(
+        # Run AutoReject (modifies raw in-place)
+        ar_results = find_bad_channels_autoreject_by_type(
             raw,
             which_types=ar_types,
             filter_settings=fset,
             epoch_settings=eset,
             consensus_thresh=consensus_thresh,
             global_epoch_thresh=global_epoch_thresh,
-            interactive=False,
+            interactive=False,  # ALWAYS non-interactive in Stage 1
             logger=logger
         )
-        logger.info(f"[checkpoint] Stage 1 AutoReject complete")
-        logger.info(f"[checkpoint] Detected bad channels: {raw.info.get('bads', [])}")
 
-        # Save checkpoint
-        _atomic_save_fif(raw, parproc_fif)
-        man = _build_manifest(stage="stage1_complete", extra={
-            "results": {
-                "bads_detected": list(raw.info.get('bads', [])),
-                "n_bad_channels": len(raw.info.get('bads', [])),
-                "n_annotations": int(len(raw.annotations) if raw.annotations is not None else 0),
-                "autoreject_details": bads_dict,
+        ar_metadata = {
+            "autoreject_enabled": True,
+            "autoreject_results": ar_results,
+            "parameters": {
+                "which_types": ar_types,
+                "filter_settings": fset,
+                "epoch_settings": eset,
+                "consensus_thresh": consensus_thresh,
+                "global_epoch_thresh": global_epoch_thresh
             }
-        })
-        save_yaml(str(manifest_path), make_serializable(man))
-        logger.info(f"[checkpoint] ✅ checkpoint saved: {parproc_fif}")
+        }
 
-        # Return control to main
-        if exit_after:
-            logger.info("[checkpoint] Two-stage mode: Exiting after Stage 1")
-            return ('exit', raw)
-        else:
-            logger.info("[checkpoint] Continuous mode: Stage 1 complete")
-            return ('continue', raw)
+        logger.info(f"[AR Stage 1] ✅ AutoReject complete. Bad channels: {raw.info.get('bads', [])}")
+    else:
+        logger.info("[AR Stage 1] AutoReject disabled - proceeding without bad channel detection")
+        ar_metadata = {"autoreject_enabled": False}
 
-    # ========================================================================
-    # STAGE 2: Load checkpoint and do interactive review (when checkpoint EXISTS)
-    # ========================================================================
-    logger.info("[checkpoint] Stage 2: interactive review from checkpoint")
-
-    # Load prior manifest for validation
+    # Save checkpoint
     try:
-        prior_manifest = load_yaml(str(manifest_path))
-    except Exception as e:
-        raise RuntimeError(f"Cannot read checkpoint manifest: {e}")
-
-    # YAML consistency check — warn by default (hybrid-friendly)
-    want = prior_manifest.get("inputs", {}).get("yaml_sha256")
-    have = None
-    yaml_path_local = cfg.get("_cfg_path", "")
-    if yaml_path_local and Path(yaml_path_local).exists():
-        try:
-            have = _yaml_sha256(Path(yaml_path_local).read_text())
-        except Exception as e:
-            logger.warning(f"[checkpoint] Cannot read current YAML for validation: {e}")
-            have = want
-    yaml_mismatch = bool(want and have and want != have)
-
-    if yaml_mismatch:
-        if allow_yaml_diff:
-            logger.warning(
-                "[checkpoint] ⚠️ YAML has changed since checkpoint creation. "
-                "Proceeding with Stage 2 using the CURRENT YAML. "
-                "The updated manifest will record both hashes."
-            )
+        atomic_writes = chk_cfg.get("atomic_writes", True)
+        if atomic_writes:
+            tmp_path = checkpoint_path.with_name(checkpoint_path.stem + "_tmp.fif")
+            raw.save(str(tmp_path), overwrite=True)
+            tmp_path.replace(checkpoint_path)
         else:
-            logger.warning(
-                "[checkpoint] ⚠️ YAML has changed since checkpoint creation. "
-                "Proceeding with Stage 2 using the CURRENT YAML. "
-                "To silence this warning, set 'checkpoint.allow_resume_with_different_yaml: true'."
-            )
-    else:
-        logger.info("[checkpoint] YAML matches the checkpoint YAML.")
+            raw.save(str(checkpoint_path), overwrite=True)
 
-    # Load checkpoint data
-    raw_parproc = mne.io.read_raw_fif(str(parproc_fif), preload=True, verbose="error")
-    if validate_integrity and not _validate_checkpoint_integrity(raw_parproc, prior_manifest.get("results", {})):
-        raise RuntimeError("Checkpoint integrity validation failed")
+        logger.info(f"[AR Stage 1] ✅ Checkpoint saved: {checkpoint_path}")
 
-    # Interactive review
-    if interactive_bad_channels:
-        ar_cfg = cfg.get("autoreject", {})
-        raw_parproc = _run_interactive_review_only(raw_parproc, ar_cfg, logger)
-        _atomic_save_fif(raw_parproc, parproc_fif)
+    except Exception as e:
+        logger.error(f"[AR Stage 1] Failed to save checkpoint: {e}")
+        raise
 
-        # Update manifest, recording both hashes if available
-        man2 = _build_manifest(
-            "stage2_reviewed",
-            extra={
-                "results": {
-                    "bads_after_review": list(raw_parproc.info.get('bads', [])),
-                    "n_bad_channels_reviewed": len(raw_parproc.info.get('bads', [])),
-                    "n_annotations": int(len(raw_parproc.annotations) if raw_parproc.annotations is not None else 0),
-                }
-            },
-            current_yaml_hash=have,
-            prior_yaml_hash=want
+    # Prepare metadata for manifest
+    stage1_metadata = {
+        "checkpoint_path": str(checkpoint_path),
+        "bads_detected": list(raw.info.get('bads', [])),
+        "n_bad_channels": len(raw.info.get('bads', [])),
+        "n_annotations": int(len(raw.annotations) if raw.annotations is not None else 0),
+        **ar_metadata
+    }
+
+    return (checkpoint_path, stage1_metadata)
+
+
+def run_interactive_review_stage2(checkpoint_path, cfg, logger):
+    """
+    Stage 2: Load checkpoint and run interactive bad channel review.
+
+    This function:
+    - Loads checkpoint FIF file
+    - Creates filtered/downsampled copy for interactive viewing
+    - Runs interactive plotting for bad channel review
+    - Updates and saves checkpoint with user changes
+    - Returns updated raw object and metadata
+
+    Args:
+        checkpoint_path: Path to checkpoint FIF file
+        cfg: Configuration dictionary
+        logger: Logger instance
+
+    Returns:
+        tuple: (updated_raw, stage2_metadata)
+    """
+    import mne
+    from pathlib import Path
+
+    # Load checkpoint
+    logger.info(f"[AR Stage 2] Loading checkpoint: {checkpoint_path}")
+    try:
+        raw = mne.io.read_raw_fif(str(checkpoint_path), preload=True, verbose="error")
+        logger.info(f"[AR Stage 2] ✅ Loaded: {len(raw.ch_names)} channels, "
+                    f"{raw.times[-1]:.1f}s, {len(raw.info.get('bads', []))} bad channels")
+    except Exception as e:
+        logger.error(f"[AR Stage 2] Failed to load checkpoint: {e}")
+        raise
+
+    # Check if interactive review is enabled
+    if not cfg.get("interactive_bad_channels", True):
+        logger.info("[AR Stage 2] Interactive review disabled - returning checkpoint as-is")
+        stage2_metadata = {
+            "interactive_review_enabled": False,
+            "bads_after_review": list(raw.info.get('bads', [])),
+            "n_bad_channels_final": len(raw.info.get('bads', [])),
+            "n_annotations_final": int(len(raw.annotations) if raw.annotations is not None else 0)
+        }
+        return (raw, stage2_metadata)
+
+    # Get filter settings for interactive viewing (same as Stage 1 AR)
+    ar_cfg = cfg.get("autoreject", {})
+    fset = ar_cfg.get("filter", {'highpass': 1.0, 'lowpass': 40.0, 'resample_hz': None})
+    l_freq = float(fset.get('highpass', 1.0))
+    h_freq = float(fset.get('lowpass', 40.0))
+    resample_hz = fset.get('resample_hz')
+
+    # Create filtered copy for interactive viewing
+    logger.info(f"[AR Stage 2] Creating filtered copy for interactive review: {l_freq}-{h_freq} Hz")
+    try:
+        raw_filtered = raw.copy().filter(l_freq=l_freq, h_freq=h_freq, verbose='ERROR')
+        if resample_hz:
+            resample_hz = float(resample_hz)
+            raw_filtered.resample(resample_hz, npad="auto")
+            logger.info(f"[AR Stage 2] Resampled to {resample_hz} Hz for viewing")
+    except Exception as e:
+        logger.error(f"[AR Stage 2] Failed to create filtered copy: {e}")
+        # Fall back to unfiltered if filtering fails
+        raw_filtered = raw.copy()
+
+    # Store original state for comparison
+    original_bads = set(raw.info.get('bads', []))
+    original_n_annotations = len(raw.annotations) if raw.annotations is not None else 0
+
+    # Run interactive review
+    logger.info("[AR Stage 2] 🎮 Opening interactive review window...")
+    logger.info("Instructions:")
+    logger.info("  - Click channel names to mark/unmark as bad")
+    logger.info("  - Click time segments to mark/unmark annotations")
+    logger.info("  - Use mouse wheel to zoom")
+    logger.info("  - Close window when done")
+
+    try:
+        n_channels = min(32, len(raw_filtered.ch_names))
+        raw_filtered.plot(
+            n_channels=n_channels,
+            duration=30.0,
+            scalings='auto',
+            show=True,
+            block=True,
+            title=f"Stage 2 Review - {len(raw_filtered.info['bads'])} bad channels"
         )
-        save_yaml(str(manifest_path), make_serializable(man2))
-        logger.info("[checkpoint] ✅ checkpoint updated after interactive review (manifest includes YAML audit)")
 
-        # IMPORTANT: return to caller
-        return ('continue', raw_parproc)
+        print("\n" + "=" * 60)
+        print("🎯 INTERACTIVE REVIEW COMPLETE")
+        print("   - Close the plot window if you haven't already")
+        print("   - Changes will be saved to checkpoint")
+        print("=" * 60)
+
+        response = input("Press Enter to save changes (or 'abort' to cancel): ").strip().lower()
+        if response == 'abort':
+            logger.info("[AR Stage 2] ❌ User aborted - keeping original state")
+            del raw_filtered
+            stage2_metadata = {
+                "interactive_review_enabled": True,
+                "user_aborted": True,
+                "bads_after_review": list(original_bads),
+                "n_bad_channels_final": len(original_bads),
+                "n_annotations_final": original_n_annotations
+            }
+            return (raw, stage2_metadata)
+
+    except Exception as e:
+        logger.error(f"[AR Stage 2] Interactive plotting failed: {e}")
+        logger.info("[AR Stage 2] Continuing with original checkpoint state")
+        del raw_filtered
+        stage2_metadata = {
+            "interactive_review_enabled": True,
+            "plotting_failed": True,
+            "error": str(e),
+            "bads_after_review": list(original_bads),
+            "n_bad_channels_final": len(original_bads),
+            "n_annotations_final": original_n_annotations
+        }
+        return (raw, stage2_metadata)
+
+    # Transfer changes from filtered copy back to original raw
+    final_bads = set(raw_filtered.info.get('bads', []))
+    added_bads = final_bads - original_bads
+    removed_bads = original_bads - final_bads
+
+    if added_bads:
+        logger.info(f"[AR Stage 2] ✅ User marked as bad: {sorted(added_bads)}")
+    if removed_bads:
+        logger.info(f"[AR Stage 2] 🔄 User rescued channels: {sorted(removed_bads)}")
+    if not added_bads and not removed_bads:
+        logger.info("[AR Stage 2] No bad channel changes made")
+
+    # Update original raw with user changes
+    raw.info['bads'] = sorted(final_bads)
+
+    # Transfer annotation changes
+    if raw_filtered.annotations is not None and len(raw_filtered.annotations) > 0:
+        # Note: Annotations need to be scaled back if resampling was applied
+        if resample_hz and resample_hz != raw.info['sfreq']:
+            scale_factor = raw.info['sfreq'] / resample_hz
+            scaled_onsets = [onset * scale_factor for onset in raw_filtered.annotations.onset]
+            scaled_durations = [dur * scale_factor for dur in raw_filtered.annotations.duration]
+
+            from mne import Annotations
+            scaled_annotations = Annotations(
+                onset=scaled_onsets,
+                duration=scaled_durations,
+                description=list(raw_filtered.annotations.description),
+                orig_time=raw.annotations.orig_time if raw.annotations else None
+            )
+            raw.set_annotations(scaled_annotations)
+        else:
+            raw.set_annotations(raw_filtered.annotations)
+
+        final_n_annotations = len(raw.annotations)
+        annotation_change = final_n_annotations - original_n_annotations
+        if annotation_change != 0:
+            logger.info(f"[AR Stage 2] Annotation changes: {annotation_change:+d} "
+                        f"(total: {final_n_annotations})")
     else:
-        logger.info("[checkpoint] Interactive review disabled.")
-        return ('continue', raw_parproc)
+        final_n_annotations = 0
+        if original_n_annotations > 0:
+            logger.info(f"[AR Stage 2] All annotations removed")
 
-    # ---- Safety guard (should never hit)
-    # If we ever get here, something fell through unexpectedly
-    logger.error("[checkpoint] Internal error: unexpected fallthrough in run_autoreject_with_checkpoint")
-    return ('continue', raw)
+    # Clean up filtered copy
+    del raw_filtered
+
+    # Save updated checkpoint
+    chk_cfg = cfg.get("checkpoint", {})
+    try:
+        atomic_writes = chk_cfg.get("atomic_writes", True)
+        if atomic_writes:
+            tmp_path = checkpoint_path.with_name(checkpoint_path.stem + "_tmp.fif")
+            raw.save(str(tmp_path), overwrite=True)
+            tmp_path.replace(checkpoint_path)
+        else:
+            raw.save(str(checkpoint_path), overwrite=True)
+
+        logger.info(f"[AR Stage 2] ✅ Updated checkpoint saved")
+
+    except Exception as e:
+        logger.error(f"[AR Stage 2] Failed to save updated checkpoint: {e}")
+        # Continue anyway - we have the updated raw object
+
+    # Prepare Stage 2 metadata
+    stage2_metadata = {
+        "interactive_review_enabled": True,
+        "user_aborted": False,
+        "plotting_failed": False,
+        "changes_made": {
+            "bad_channels_added": sorted(added_bads),
+            "bad_channels_removed": sorted(removed_bads),
+            "annotation_change": final_n_annotations - original_n_annotations
+        },
+        "bads_after_review": list(raw.info.get('bads', [])),
+        "n_bad_channels_final": len(raw.info.get('bads', [])),
+        "n_annotations_final": final_n_annotations,
+        "filter_settings_used": fset
+    }
+
+    logger.info("[AR Stage 2] 🎉 Interactive review completed successfully!")
+    return (raw, stage2_metadata)
 
 # ========== CORE MODULES ==========
 
@@ -575,13 +542,13 @@ def get_head_pos_for_maxwell(raw: mne.io.Raw,
             logger.error(f"Failed to write computed .pos file: {e}")
         return None
 
-def load_raw_data(config: dict) -> mne.io.Raw:
+def load_raw_data(cfg: dict) -> mne.io.Raw:  # CHANGED: config -> cfg
     bids_path = BIDSPath(
-        subject=config['subject'],
-        session=config.get('session'),
-        task=config.get('task'),
-        run=config.get('run'),
-        root=config['bids_root'],
+        subject=cfg['subject'],           # CHANGED: config -> cfg
+        session=cfg.get('session'),       # CHANGED: config -> cfg
+        task=cfg.get('task'),             # CHANGED: config -> cfg
+        run=cfg.get('run'),               # CHANGED: config -> cfg
+        root=cfg['bids_root'],            # CHANGED: config -> cfg
         datatype='meg'
     )
     fname = f"sub-{bids_path.subject}"
@@ -727,37 +694,771 @@ def apply_metadata_repairs(raw: mne.io.Raw, metadata_cfg: dict) -> Dict[str, Any
             logger.error(f"Error in expert_patch: {e}")
     return repairs
 
+#----------- Writing the manifest ---------------
 
-# ---------- IMPROVED AUTOREJECT FUNCTION ----------
-def find_bad_channels_autoreject_by_type_improved(
+def write_stage1_manifest(raw, cfg, bids_path, checkpoint_file=None,  # CHANGED: config -> cfg
+                         autoreject_results=None, quality_metrics=None,
+                         head_movement_stats=None, rank_info=None,
+                         eeg_setup_results=None, metadata_repair_results=None,
+                         original_recording_info=None, notch_filter_params=None,
+                         processing_paths=None, logger=None):
+    """
+    Write comprehensive Stage 1 manifest file with all processing results and metadata.
+    This manifest serves as the complete log of Stage 1 processing and provides
+    all necessary information for Stage 2 continuation.
+
+    Args:
+        raw: MNE Raw object (after all Stage 1 processing)
+        config: Pipeline configuration dictionary
+        bids_path: BIDS path object
+        checkpoint_file: Path to checkpoint FIF file
+        autoreject_results: Dictionary of AutoReject results
+        quality_metrics: Dictionary of quality metrics (pre/post Maxwell, improvements)
+        head_movement_stats: Head movement analysis results
+        rank_info: MEG rank estimation results
+        eeg_setup_results: EEG channel setup results
+        metadata_repair_results: Metadata repair results
+        original_recording_info: Original recording metadata
+        notch_filter_params: Notch filtering parameters
+        processing_paths: Processing paths (plots directory, etc.)
+        logger: Logger instance
+
+    Returns:
+        Path to manifest file
+    """
+    if logger is None:
+        logger = logging.getLogger("pipeline")
+
+    # Get checkpoint configuration
+    chk_cfg = cfg.get("checkpoint", {})
+    derivatives_root = chk_cfg.get("derivatives_root", "derivatives")
+    pipeline_name = chk_cfg.get("pipeline_name", "preprocessing")
+
+    # Build paths (same as in run_autoreject_with_checkpoint)
+    bids_root = Path(cfg.get("bids_root", bids_path.root))
+    deriv_root = bids_root / derivatives_root / pipeline_name
+
+    # Build proper subject/session directory structure
+    subject_dir = f"sub-{bids_path.subject}"
+    if bids_path.session:
+        session_dir = f"ses-{bids_path.session}"
+        parproc_dir = deriv_root / subject_dir / session_dir / "meg"
+    else:
+        parproc_dir = deriv_root / subject_dir / "meg"
+
+    # Build checkpoint filename
+    base_name = f"sub-{bids_path.subject}"
+    if bids_path.session:
+        base_name += f"_ses-{bids_path.session}"
+    if bids_path.task:
+        base_name += f"_task-{bids_path.task}"
+    if bids_path.run:
+        base_name += f"_run-{bids_path.run}"
+
+    parproc_fif = parproc_dir / f"{base_name}_desc-parproc_meg.fif"
+    manifest_path = parproc_fif.with_name(parproc_fif.stem + "_manifest.yaml")
+
+    # Read YAML hash for provenance tracking
+    yaml_text = None
+    yaml_hash = None
+    try:
+        yaml_path_local = cfg.get("_cfg_path", "")
+        if yaml_path_local and Path(yaml_path_local).exists():
+            yaml_text = Path(yaml_path_local).read_text()
+            import hashlib
+            yaml_hash = hashlib.sha256(yaml_text.encode("utf-8")).hexdigest()
+    except Exception as e:
+        logger.warning(f"Could not read YAML for manifest: {e}")
+
+    # Get current system info for Stage 1
+    stage1_system_info = get_runtime_info()
+    stage1_system_info["stage"] = "stage1"
+    stage1_system_info["completed_utc"] = datetime.utcnow().isoformat() + "Z"
+
+    # Build comprehensive manifest
+    manifest = {
+        # Header information
+        "manifest_version": "2.0",  # Updated version to indicate enhanced format
+        "created_utc": datetime.utcnow().isoformat() + "Z",
+        "stage": "stage1_complete",
+        "pipeline_version": cfg.get("pipeline_version", "1.2"),
+        "checkpoint_version": cfg.get("_checkpoint_version", "1.0"),
+
+        # System information - Stage 1
+        "system_info": {
+            "stage1": stage1_system_info,
+            "stage2": None  # Will be filled by Stage 2
+        },
+
+        # Input configuration and provenance
+        "inputs": {
+            "bids": {
+                "subject": bids_path.subject,
+                "session": bids_path.session,
+                "task": bids_path.task,
+                "run": bids_path.run,
+            },
+            "bids_root": str(bids_root),
+            "yaml_path": cfg.get("_cfg_path", None),
+            "yaml_sha256": yaml_hash,
+            "original_recording": original_recording_info or {}
+        },
+
+        # Artifacts and outputs from Stage 1
+        "artifacts": {
+            "parproc_raw_fif": checkpoint_file or str(parproc_fif),
+            "manifest_path": str(manifest_path),
+            "plots_directory": processing_paths.get("plots_directory") if processing_paths else None
+        },
+
+        # Configuration parameters used in Stage 1
+        "parameters": {
+            "autoreject": cfg.get("autoreject", {}),
+            "checkpoint": chk_cfg,
+            "head_movement": cfg.get("head_movement", {}),
+            "maxwell_filter": {
+                "calibration_file": cfg.get("calibration_file"),
+                "cross_talk_file": cfg.get("cross_talk_file"),
+            },
+            "notch_filter": notch_filter_params or {},
+            "line_freq": cfg.get("line_freq", 60.0),
+            "interactive_bad_channels": cfg.get("interactive_bad_channels", True),
+            "metadata_fixes": cfg.get("metadata_fixes", {}),
+            "eeg_handling": cfg.get("eeg_handling", {})
+        },
+
+        # Processing results from each stage
+        "processing_results": {
+            # EEG setup results
+            "eeg_setup": eeg_setup_results or {},
+
+            # Metadata repairs
+            "metadata_repairs": metadata_repair_results or {},
+
+            # Head movement analysis
+            "head_movement": head_movement_stats or {"enabled": False},
+
+            # Rank estimation
+            "rank_estimation": rank_info or {},
+
+            # AutoReject results
+            "autoreject": {
+                "bads_detected": list(raw.info.get('bads', [])),
+                "n_bad_channels": len(raw.info.get('bads', [])),
+                "n_annotations": int(len(raw.annotations) if raw.annotations is not None else 0),
+                **(autoreject_results or {})
+            }
+        },
+
+        # Quality metrics (comprehensive)
+        "quality_metrics": quality_metrics or {},
+
+        # Final state information
+        "final_state": {
+            "recording_duration_sec": float(raw.times[-1]),
+            "sampling_frequency": float(raw.info['sfreq']),
+            "n_channels_total": len(raw.ch_names),
+            "n_bad_channels": len(raw.info.get('bads', [])),
+            "bad_channels": list(raw.info.get('bads', [])),
+            "n_annotations": int(len(raw.annotations) if raw.annotations is not None else 0),
+            "channel_counts": {
+                "meg_mag": len(mne.pick_types(raw.info, meg='mag', exclude='bads')),
+                "meg_grad": len(mne.pick_types(raw.info, meg='grad', exclude='bads')),
+                "eeg": len(mne.pick_types(raw.info, eeg=True, exclude='bads')),
+                "eog": len(mne.pick_types(raw.info, eog=True, exclude='bads')),
+                "ecg": len(mne.pick_types(raw.info, ecg=True, exclude='bads')),
+                "stim": len(mne.pick_types(raw.info, stim=True, exclude='bads')),
+            }
+        },
+
+        # Stage 1 completion flag
+        "stage1_complete": True,
+        "exit_after_checkpoint": chk_cfg.get("exit_after_checkpoint", False)
+    }
+
+    # Save manifest with proper serialization
+    try:
+        save_yaml(str(manifest_path), make_serializable(manifest))
+        logger.info(f"[manifest] ✅ Stage 1 manifest saved: {manifest_path}")
+
+        # Log key metrics for immediate feedback
+        if quality_metrics and 'maxwell_improvements' in quality_metrics:
+            score_info = quality_metrics['maxwell_improvements'].get('overall_quality_score', {})
+            logger.info(f"[manifest] Quality Score: {score_info.get('value', 'N/A')}/100 "
+                        f"(Grade: {score_info.get('grade', 'N/A')})")
+
+        if head_movement_stats and 'translation_stats_mm' in head_movement_stats:
+            max_disp = head_movement_stats['translation_stats_mm']['max_displacement']
+            logger.info(f"[manifest] Max head movement: {max_disp:.1f} mm")
+
+        if rank_info and rank_info.get('meg_rank'):
+            logger.info(f"[manifest] MEG rank: {rank_info['meg_rank']}")
+
+        logger.info(f"[manifest] Bad channels: {len(manifest['final_state']['bad_channels'])}")
+
+    except Exception as e:
+        logger.error(f"Failed to write Stage 1 manifest: {e}")
+        raise
+
+    return manifest_path
+
+# ========== QUALITY METRICS FUNCTIONS ==========
+# Add these functions to your meg_pipeline_utils.py file
+# Required additional import: from scipy.stats import kurtosis
+
+def compute_meg_quality_metrics(raw: mne.io.Raw, stage_name: str = "raw") -> Dict[str, Any]:
+    """
+    Compute MEG/EEG quality metrics (SI units) for a single pipeline stage.
+
+    Returns SI units for machine-readability:
+      mag=T, grad=T/m, eeg=V. Use separate logging helpers to print fT, fT/cm, µV.
+    """
+    metrics: Dict[str, Any] = {
+        "stage": stage_name,
+        "timestamp": datetime.now().isoformat(),
+    }
+
+    # ---- Recording metadata ----
+    try:
+        duration_sec = float(raw.n_times) / float(raw.info["sfreq"])
+    except Exception:
+        duration_sec = float(raw.times[-1]) if len(raw.times) else None
+
+    all_ch_names = list(raw.ch_names)
+    bads = list(raw.info.get("bads", [])) if "bads" in raw.info else []
+
+    metrics["recording"] = {
+        "duration_sec": duration_sec,
+        "sfreq": float(raw.info["sfreq"]),
+        "n_channels_total": int(len(all_ch_names)),
+        "bad_channels": bads,
+        "n_bad": int(len(bads)),
+        "n_annotations": int(len(getattr(raw, "annotations", []) or [])),
+    }
+
+    # ---- Channel picks ----
+    def _pick(raw, meg=None, eeg=False):
+        return mne.pick_types(raw.info, meg=meg, eeg=eeg, stim=False, eog=False, ecg=False, seeg=False, misc=False, exclude=[])
+
+    channel_types = {
+        "mag":  dict(picks=lambda r: _pick(r, meg='mag')),
+        "grad": dict(picks=lambda r: _pick(r, meg='grad')),
+        "eeg":  dict(picks=lambda r: _pick(r, meg=False, eeg=True)),
+    }
+
+    line_freq = float(raw.info.get("line_freq", 60.0) or 60.0)
+    nyq = float(raw.info["sfreq"]) / 2.0
+
+    # ---- Helpers ----
+    def _amplitude_stats(data: np.ndarray) -> Dict[str, Any]:
+        """RMS/variance on demeaned data; P2P 95% on raw channel P2P (SI)."""
+        if data.size == 0:
+            return {"rms": None, "peak_to_peak_95pct": None, "variance": None, "n_channels": 0}
+        data_demean = data - data.mean(axis=1, keepdims=True)
+        rms = float(np.sqrt((data_demean ** 2).mean()))
+        ptp95 = float(np.percentile(np.ptp(data, axis=1), 95))
+        var = float(data_demean.var())
+        return {"rms": rms, "peak_to_peak_95pct": ptp95, "variance": var, "n_channels": int(data.shape[0])}
+
+    def _band_power(raw, picks, fmin, fmax):
+        """Mean PSD power over [fmin,fmax] with Nyquist guard (power units)."""
+        if fmin >= nyq:
+            return None
+        try:
+            fmax_use = min(fmax, nyq - 1e-6)
+            psd = raw.compute_psd(picks=picks, fmin=fmin, fmax=fmax_use, verbose='ERROR')
+            return float(psd.get_data().mean())
+        except Exception:
+            return None
+
+    def _one_over_f(raw, picks):
+        """1/f slope & intercept on log10 PSD, 1–45 Hz, masking 8–13 Hz (alpha)."""
+        fmin, fmax = 1.0, min(45.0, nyq - 1e-6)
+        try:
+            psd = raw.compute_psd(picks=picks, fmin=fmin, fmax=fmax, verbose='ERROR')
+            freqs = psd.freqs
+            data = psd.get_data()
+            if data.size == 0:
+                return {"slope": None, "intercept": None}
+            p = data.mean(axis=0)
+            mask = (freqs >= fmin) & (freqs <= fmax) & ~((freqs >= 8.0) & (freqs <= 13.0))
+            x = np.log10(freqs[mask])
+            y = np.log10(p[mask] + np.finfo(float).tiny)
+            A = np.vstack([x, np.ones_like(x)]).T
+            sol, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+            return {"slope": float(sol[0]), "intercept": float(sol[1])}
+        except Exception:
+            return {"slope": None, "intercept": None}
+
+    def _line_harmonics(raw, picks, line_freq):
+        """Peak power at 1x/2x/3x line freq and peak/sideband ratio (exclude center)."""
+        out = {}
+        for harm in (1, 2, 3):
+            f0 = line_freq * harm
+            if f0 >= nyq or f0 <= 0:
+                out[f"line_{harm}x_peak"] = None
+                out[f"line_{harm}x_ratio"] = None
+                continue
+            try:
+                psd_narrow = raw.compute_psd(picks=picks, fmin=f0 - 0.5, fmax=f0 + 0.5, verbose='ERROR')
+                idx0 = np.argmin(np.abs(psd_narrow.freqs - f0))
+                peak_power = float(psd_narrow.get_data()[:, idx0].mean())
+
+                side_low  = raw.compute_psd(picks=picks, fmin=max(f0 - 3.0, 0.1), fmax=max(f0 - 1.0, 0.2), verbose='ERROR')
+                side_high = raw.compute_psd(picks=picks, fmin=f0 + 1.0,            fmax=min(f0 + 3.0, nyq - 1e-6), verbose='ERROR')
+                side_mean = np.mean([side_low.get_data().mean(), side_high.get_data().mean()])
+                ratio = float(peak_power / side_mean) if side_mean > 0 else None
+
+                out[f"line_{harm}x_peak"] = peak_power
+                out[f"line_{harm}x_ratio"] = ratio
+            except Exception:
+                out[f"line_{harm}x_peak"] = None
+                out[f"line_{harm}x_ratio"] = None
+        return out
+
+    # ---- Per-type metrics ----
+    for ch_type, cfg in channel_types.items():
+        picks = cfg["picks"](raw)
+        if picks is None or len(picks) == 0:
+            continue
+
+        try:
+            data = raw.get_data(picks=picks)
+        except Exception:
+            data = np.empty((0, 0))
+
+        metrics[f"{ch_type}_amplitude"] = _amplitude_stats(data)
+
+        # Kurtosis (dimensionless)
+        try:
+            k = kurtosis(data, axis=1, fisher=False, bias=False, nan_policy='omit') if data.size else np.array([])
+            metrics[f"{ch_type}_kurtosis"] = {
+                "mean": float(np.nanmean(k)) if k.size else None,
+                "max":  float(np.nanmax(k))  if k.size else None,
+                "std":  float(np.nanstd(k))  if k.size else None,
+            }
+        except Exception:
+            metrics[f"{ch_type}_kurtosis"] = {"mean": None, "max": None, "std": None}
+
+        spectral: Dict[str, Any] = {}
+        # High-frequency environmental band (guard for Nyquist)
+        spectral["noise_200_250hz"] = _band_power(raw, picks, 200.0, 250.0) if nyq >= 250.0 else None
+
+        # Line noise harmonics
+        spectral.update(_line_harmonics(raw, picks, line_freq))
+
+        # Neural bands
+        bands = {
+            "delta": (0.5, 4.0),
+            "theta": (4.0, 8.0),
+            "alpha": (8.0, 13.0),
+            "beta":  (15.0, 30.0),
+            "low_gamma":  (30.0, 50.0),
+            "high_gamma": (50.0, 80.0),
+        }
+        for name, (fmin, fmax) in bands.items():
+            spectral[f"band_{name}"] = _band_power(raw, picks, fmin, fmax)
+
+        spectral["one_over_f"] = _one_over_f(raw, picks)
+        metrics[f"{ch_type}_spectral"] = spectral
+
+    # ---- cHPI quick status (best-effort) ----
+    try:
+        chpi_info = raw.info.get("hpi_meas", None)
+        hpi_n_coils = None
+        if chpi_info and isinstance(chpi_info, list) and len(chpi_info):
+            hpi_n_coils = len(chpi_info[0].get("hpi_coils", [])) if isinstance(chpi_info[0], dict) else None
+        metrics["chpi"] = {"has_hpi_meas": bool(chpi_info), "n_coils": hpi_n_coils, "active": bool(chpi_info)}
+    except Exception:
+        metrics["chpi"] = {"has_hpi_meas": None, "n_coils": None, "active": None}
+
+    # ---- SSS/Maxwell parameters if applied ----
+    if "proc_history" in raw.info:
+        for proc in raw.info["proc_history"]:
+            if isinstance(proc, dict) and "max_info" in proc:
+                max_info = proc["max_info"]
+                metrics["sss_info"] = {
+                    "in_order": int(max_info.get("in_order", 0)),
+                    "out_order": int(max_info.get("out_order", 0)),
+                    "nbad": int(max_info.get("nbad", 0)),
+                    "coord_frame": str(max_info.get("coord_frame", "unknown")),
+                }
+                break
+
+    return metrics
+
+def calculate_maxwell_improvements(metrics_before: Dict[str, Any],
+                                   metrics_after: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Calculate improvements from Maxwell filtering by comparing metric dictionaries.
+
+    Args:
+        metrics_before: Metrics computed before Maxwell
+        metrics_after: Metrics computed after Maxwell
+
+    Returns:
+        Dictionary containing shielding factors, signal preservation, and quality score
+    """
+    improvements = {
+        "timestamp": datetime.now().isoformat(),
+        "stages_compared": f"{metrics_before['stage']}_to_{metrics_after['stage']}"
+    }
+
+    # Calculate shielding factors and improvements for each channel type
+    for ch_type in ['mag', 'grad']:
+        before_spectral = metrics_before.get(f"{ch_type}_spectral", {})
+        after_spectral = metrics_after.get(f"{ch_type}_spectral", {})
+
+        if not before_spectral or not after_spectral:
+            continue
+
+        improvements[ch_type] = {}
+
+        # 1. Environmental noise reduction (shielding factor)
+        noise_key = "noise_200_250hz"
+        before_noise = before_spectral.get(noise_key)
+        after_noise = after_spectral.get(noise_key)
+
+        if before_noise is not None and after_noise is not None and before_noise > 0 and after_noise > 0:
+            factor = before_noise / after_noise
+            improvements[ch_type]["environmental_shielding"] = {
+                "factor": float(factor),
+                "db": float(10 * np.log10(factor)),
+                "percent_reduction": float((1 - 1 / factor) * 100),
+                "before_power": float(before_noise),
+                "after_power": float(after_noise),
+                "quality": "excellent" if factor > 100 else
+                "good" if factor > 10 else
+                "moderate" if factor > 3 else "poor"
+            }
+
+        # 2. Line noise reduction
+        for harm in [1, 2, 3]:
+            key = f"line_{harm}x_peak"
+            if key in before_spectral and key in after_spectral:
+                before_val = before_spectral[key]
+                after_val = after_spectral[key]
+                if before_val is not None and after_val is not None and before_val > 0 and after_val > 0:
+                    factor = before_val / after_val
+                    improvements[ch_type][f"line_{harm}x_reduction"] = {
+                        "factor": float(factor),
+                        "db": float(10 * np.log10(factor)),
+                        "percent_reduction": float((1 - 1 / factor) * 100)
+                    }
+
+        # 3. Signal preservation in neural bands
+        for band in ['theta', 'alpha', 'beta', 'low_gamma']:
+            key = f"{band}_power"
+            if key in before_spectral and key in after_spectral:
+                before_val = before_spectral[key]
+                after_val = after_spectral[key]
+                if before_val is not None and before_val > 0:
+                    preservation = after_val / before_val if after_val is not None else 0
+                    improvements[ch_type][f"{band}_preservation"] = {
+                        "ratio": float(preservation),
+                        "percent": float(preservation * 100),
+                        "assessment": "good" if 0.7 < preservation < 1.3 else
+                        "acceptable" if 0.5 < preservation < 1.5 else "poor"
+                    }
+
+        # 4. Overall amplitude changes
+        before_amp = metrics_before.get(f"{ch_type}_amplitude", {})
+        after_amp = metrics_after.get(f"{ch_type}_amplitude", {})
+        if before_amp and after_amp:
+            before_rms = before_amp.get('rms', 0)
+            after_rms = after_amp.get('rms', 0)
+            before_var = before_amp.get('variance', 0)
+            after_var = after_amp.get('variance', 0)
+
+            improvements[ch_type]["amplitude_change"] = {
+                "rms_ratio": float(after_rms / before_rms) if before_rms > 0 else None,
+                "variance_ratio": float(after_var / before_var) if before_var > 0 else None
+            }
+
+        # 5. Kurtosis change (reduction in spiky artifacts)
+        before_kurt = metrics_before.get(f"{ch_type}_kurtosis", {})
+        after_kurt = metrics_after.get(f"{ch_type}_kurtosis", {})
+        if before_kurt and after_kurt:
+            before_mean = before_kurt.get('mean', 0)
+            after_mean = after_kurt.get('mean', 0)
+            if before_mean != 0:
+                improvements[ch_type]["kurtosis_change"] = {
+                    "before": float(before_mean),
+                    "after": float(after_mean),
+                    "reduction": float(before_mean - after_mean),
+                    "percent_change": float((after_mean - before_mean) / abs(before_mean) * 100)
+                }
+
+    # 6. Calculate overall quality score
+    score = calculate_quality_score(improvements)
+    improvements['overall_quality_score'] = score
+
+    return improvements
+
+
+def calculate_quality_score(improvements: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Calculate a single quality score from Maxwell improvements.
+
+    Args:
+        improvements: Dictionary from calculate_maxwell_improvements()
+
+    Returns:
+        Dictionary with score, grade, and interpretation
+    """
+    score = 100.0
+    weights = {'mag': 0.6, 'grad': 0.4}  # Magnetometers slightly more important
+
+    details = []  # Track what affected the score
+
+    for ch_type in ['mag', 'grad']:
+        if ch_type not in improvements:
+            continue
+
+        ch_weight = weights[ch_type]
+        ch_improvements = improvements[ch_type]
+
+        # Check shielding factor (most important - 40% of score)
+        if 'environmental_shielding' in ch_improvements:
+            factor = ch_improvements['environmental_shielding'].get('factor', 1)
+            if factor < 3:
+                score -= 30 * ch_weight
+                details.append(f"{ch_type}: poor shielding (<3x)")
+            elif factor < 10:
+                score -= 15 * ch_weight
+                details.append(f"{ch_type}: moderate shielding (3-10x)")
+            elif factor > 100:
+                score += 5 * ch_weight  # Bonus for excellent shielding
+                details.append(f"{ch_type}: excellent shielding (>100x)")
+        else:
+            score -= 20 * ch_weight  # No shielding data is concerning
+            details.append(f"{ch_type}: no shielding data")
+
+        # Check signal preservation (30% of score)
+        signal_preserved = []
+        for band in ['alpha', 'beta']:
+            key = f"{band}_preservation"
+            if key in ch_improvements:
+                ratio = ch_improvements[key]['ratio']
+                signal_preserved.append(ratio)
+                if ratio < 0.5 or ratio > 2.0:
+                    score -= 10 * ch_weight
+                    details.append(f"{ch_type} {band}: poor preservation")
+                elif ratio < 0.7 or ratio > 1.3:
+                    score -= 5 * ch_weight
+                    details.append(f"{ch_type} {band}: suboptimal preservation")
+
+        # Bonus for excellent signal preservation
+        if signal_preserved and all(0.9 < r < 1.1 for r in signal_preserved):
+            score += 5 * ch_weight
+            details.append(f"{ch_type}: excellent signal preservation")
+
+        # Check line noise reduction (10% of score)
+        line_1x = ch_improvements.get('line_1x_reduction', {}).get('factor', 1)
+        if line_1x < 2:
+            score -= 5 * ch_weight
+            details.append(f"{ch_type}: poor line noise reduction")
+
+    # Ensure score is in valid range
+    final_score = float(max(0, min(100, score)))
+
+    # Determine grade
+    if final_score >= 90:
+        grade = "A"
+        interpretation = "excellent"
+    elif final_score >= 80:
+        grade = "B"
+        interpretation = "good"
+    elif final_score >= 70:
+        grade = "C"
+        interpretation = "acceptable"
+    elif final_score >= 60:
+        grade = "D"
+        interpretation = "marginal"
+    else:
+        grade = "F"
+        interpretation = "poor"
+
+    return {
+        "value": final_score,
+        "grade": grade,
+        "interpretation": interpretation,
+        "details": details[:5]  # Keep top 5 most important factors
+    }
+
+def generate_quality_summary(log_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Extract key metrics from log data for executive summary.
+
+    Args:
+        log_data: Complete pipeline log dictionary
+
+    Returns:
+        Simplified summary with key quality metrics
+    """
+    quality = log_data.get('quality_metrics', {})
+    improvements = quality.get('maxwell_improvements', {})
+
+    # Extract key values safely
+    mag_shielding = improvements.get('mag', {}).get('environmental_shielding', {})
+    grad_shielding = improvements.get('grad', {}).get('environmental_shielding', {})
+
+    # Calculate average signal preservation
+    preservation_values = []
+    for ch_type in ['mag', 'grad']:
+        for band in ['alpha', 'beta']:
+            key = f"{band}_preservation"
+            if ch_type in improvements and key in improvements[ch_type]:
+                preservation_values.append(improvements[ch_type][key].get('percent', 100))
+
+    avg_preservation = float(np.mean(preservation_values)) if preservation_values else None
+
+    summary = {
+        "session": f"{log_data.get('subject', 'unknown')}_{log_data.get('session', '')}_{log_data.get('task', '')}",
+        "date": log_data.get('runtime_info', {}).get('timestamp', 'unknown'),
+        "quality_grade": improvements.get('overall_quality_score', {}).get('grade', 'N/A'),
+        "quality_score": improvements.get('overall_quality_score', {}).get('value', None),
+        "mag_shielding_factor_db": mag_shielding.get('db', None),
+        "grad_shielding_factor_db": grad_shielding.get('db', None),
+        "signal_preservation_percent": avg_preservation,
+        "recording_duration_sec": log_data.get('recording_duration_sec', None),
+        "n_bad_channels": len(
+            log_data.get('quality_metrics', {}).get('post_maxwell', {}).get('recording', {}).get('bad_channels', []))
+    }
+
+    return summary
+
+
+# Add this function to meg_pipeline_utils.py
+
+def log_maxwell_quality_results(metrics_pre: Dict[str, Any],
+                                metrics_post: Dict[str, Any],
+                                logger: Optional[logging.Logger] = None) -> Dict[str, Any]:
+    """
+    Calculate and log Maxwell filtering quality from pre/post metrics.
+
+    Args:
+        metrics_pre: Pre-Maxwell metrics from compute_meg_quality_metrics()
+        metrics_post: Post-Maxwell metrics from compute_meg_quality_metrics()
+        logger: Optional logger instance
+
+    Returns:
+        Dictionary containing all metrics and improvements
+    """
+    if logger is None:
+        logger = logging.getLogger("pipeline")
+
+    # Calculate improvements
+    logger.info("Calculating Maxwell filter effectiveness...")
+    improvements = calculate_maxwell_improvements(metrics_pre, metrics_post)
+
+    # Log summary to console
+    quality_score = improvements.get('overall_quality_score', {})
+    logger.info(f"📊 Maxwell Quality Score: {quality_score.get('value', 0):.1f}/100 "
+                f"(Grade: {quality_score.get('grade', 'N/A')})")
+
+    # Log key metrics per channel type
+    for ch_type in ['mag', 'grad']:
+        if ch_type not in improvements:
+            continue
+
+        # Shielding factor
+        shielding = improvements[ch_type].get('environmental_shielding', {})
+        if shielding:
+            logger.info(f"  {ch_type.upper()} shielding: {shielding.get('db', 0):.1f} dB "
+                        f"({shielding.get('quality', 'unknown')})")
+
+        # Signal preservation
+        preservation = []
+        for band in ['alpha', 'beta']:
+            key = f"{band}_preservation"
+            if key in improvements[ch_type]:
+                pres = improvements[ch_type][key]
+                preservation.append(f"{band}={pres['percent']:.0f}%")
+        if preservation:
+            logger.info(f"  {ch_type.upper()} signal preserved: {', '.join(preservation)}")
+
+    # Log any quality concerns
+    if quality_score.get('details'):
+        logger.info("  Quality factors: " + "; ".join(quality_score['details'][:3]))
+
+    # Return complete metrics package
+    return {
+        "pre_maxwell": metrics_pre,
+        "post_maxwell": metrics_post,
+        "maxwell_improvements": improvements,
+        "quality_score": quality_score
+    }
+
+# ---------- IMPROVED AUTOREJECT FUNCTION (HEADLESS / STAGE 1 ONLY) ----------
+def find_bad_channels_autoreject_by_type(
         raw,
         which_types=('eeg', 'mag', 'grad'),
         filter_settings=None,
         epoch_settings=None,
         consensus_thresh=0.3,
         global_epoch_thresh=0.3,
-        interactive=False,
-        logger=None
+        interactive=False,   # kept for API compatibility; ignored here
+        logger=None,
+        cfg=None
 ):
     """
-    IMPROVED: Detect bad channels (RANSAC + AutoReject) and globally bad epochs.
+    Detect bad channels (EEG RANSAC + AutoReject) and globally bad epochs, then
+    write results back to the ORIGINAL raw object (bads + BAD_GlobalEpoch annotations).
 
-    Key improvements:
-    - Better memory management (process types separately if configured)
-    - More robust annotation handling using sample indices
-    - Improved error handling and validation
-    - Better interactive workflow with progress saving
-    - Enhanced logging and debugging information
+    This function is **Stage 1 only (headless)**:
+    - It ignores `interactive=True` and logs a warning, because all interactive
+      review is handled in Stage 2 (`run_interactive_review_stage2`).
+
+    Parameters
+    ----------
+    raw : mne.io.Raw
+        Original raw object. Will be modified in-place (bads + annotations).
+    which_types : tuple[str]
+        Channel types to analyze: any subset of ('eeg', 'mag', 'grad').
+    filter_settings : dict or None
+        {'highpass': float, 'lowpass': float, 'resample_hz': float|None}
+        Defaults: 1–40 Hz, no resample.
+    epoch_settings : dict or None
+        {'duration': float, 'tmin': float, 'tmax': float}
+        Defaults: duration=2.0, tmin=0.0, tmax=2.0
+    consensus_thresh : float
+        Channel marked bad if rejected in > consensus_thresh fraction of epochs.
+    global_epoch_thresh : float
+        Epoch marked bad if fraction of channels rejected > global_epoch_thresh.
+    interactive : bool
+        Ignored (Stage 1 only). Kept for API stability.
+    logger : logging.Logger or None
+        Logger to use.
+    cfg : dict or None
+        Full pipeline config (used to read `autoreject` sub-keys such as
+        n_interpolate, cv_folds, thresh_method).
+
+    Returns
+    -------
+    detected_bads : dict
+        {
+          'eeg': [...], 'mag': [...], 'grad': [...],
+          'eeg_global_bad_epochs': [sample_idx, ...], ...
+        }
+        Note: *_global_bad_epochs are **sample indices in ORIGINAL raw**.
     """
     import numpy as np
     from collections import Counter
     import logging
     import mne
     from mne.annotations import Annotations
-    import time
 
     if logger is None:
         logger = logging.getLogger("pipeline")
+
+    # Warn and ignore interactive for Stage 1
+    if interactive:
+        logger.warning(
+            "interactive=True was passed to find_bad_channels_autoreject_by_type, "
+            "but Stage 1 is headless. Ignoring interactive mode here; "
+            "use run_interactive_review_stage2 for UI-driven review."
+        )
 
     # Parse params with safe defaults
     filter_settings = filter_settings or {'highpass': 1.0, 'lowpass': 40.0, 'resample_hz': None}
@@ -777,23 +1478,22 @@ def find_bad_channels_autoreject_by_type_improved(
 
     detected_bads = {}
     all_bad_channels = set()
-    all_global_bad_epochs = set()  # Use sample indices for precision
+    all_global_bad_epochs = set()  # sample indices in ORIGINAL raw
 
-    # Create filtered copy - improved memory management
+    # Create filtered copy for detection
     logger.info(f"Creating filtered copy for bad detection: {l_freq}-{h_freq} Hz"
                 + (f", resample→{resample_hz} Hz" if resample_hz else ""))
-
     try:
         raw_filt_all = raw.copy().filter(l_freq=l_freq, h_freq=h_freq, verbose='ERROR')
         if resample_hz:
-            original_sfreq = raw_filt_all.info['sfreq']
+            original_sfreq = float(raw_filt_all.info['sfreq'])
             raw_filt_all.resample(resample_hz, npad="auto")
-            logger.info(f"Resampled from {original_sfreq:.1f} Hz to {resample_hz:.1f} Hz")
+            logger.info(f"Resampled from {original_sfreq:.1f} Hz to {float(resample_hz):.1f} Hz")
     except Exception as e:
         logger.error(f"Failed to create filtered copy: {e}")
-        raise e
+        raise
 
-    # Helper: pick channels per type
+    # Helper: pick channels per type (from ORIGINAL raw.info)
     def _picks_for(typ):
         if typ == 'eeg':
             return mne.pick_types(raw.info, eeg=True, meg=False, exclude='bads')
@@ -803,7 +1503,7 @@ def find_bad_channels_autoreject_by_type_improved(
             return mne.pick_types(raw.info, meg='grad', eeg=False, exclude='bads')
         return np.array([], dtype=int)
 
-    # Run detection per type
+    # Iterate by type
     for typ in which_types:
         logger.info(f"\n=== AutoReject pass for {typ.upper()} ===")
         picks = _picks_for(typ)
@@ -815,7 +1515,8 @@ def find_bad_channels_autoreject_by_type_improved(
 
         ch_names = [raw.ch_names[i] for i in picks]
         logger.info(
-            f"Analyzing {len(ch_names)} {typ.upper()} channels: {ch_names[:5]}{'...' if len(ch_names) > 5 else ''}")
+            f"Analyzing {len(ch_names)} {typ.upper()} channels: {ch_names[:5]}{'...' if len(ch_names) > 5 else ''}"
+        )
 
         # Work on filtered copy containing only these channels
         try:
@@ -855,7 +1556,7 @@ def find_bad_channels_autoreject_by_type_improved(
             detected_bads[f"{typ}_global_bad_epochs"] = []
             continue
 
-        # RANSAC (EEG only, deterministic)
+        # RANSAC (EEG only)
         bads_ransac = []
         if typ == 'eeg':
             try:
@@ -869,7 +1570,7 @@ def find_bad_channels_autoreject_by_type_improved(
                 logger.warning(f"RANSAC failed for EEG: {e}")
                 bads_ransac = []
 
-        # Local AutoReject on remaining "good" channels
+        # AutoReject on remaining "good" channels
         if typ == 'eeg':
             picks_good = [ch for ch in epochs.ch_names if ch not in bads_ransac]
         else:
@@ -885,8 +1586,8 @@ def find_bad_channels_autoreject_by_type_improved(
                 logger.info(f"Running AutoReject on {len(picks_good)} good {typ.upper()} channels...")
 
                 epochs_good = epochs.copy().pick_channels(picks_good)
-                # Get AutoReject configuration parameters
-                ar_cfg = cfg.get("autoreject", {})
+                # AutoReject config params
+                ar_cfg = cfg.get("autoreject", {}) if cfg else {}
                 ar = AutoReject(
                     n_interpolate=ar_cfg.get("n_interpolate", [0]),
                     cv=ar_cfg.get("cv_folds", 5),
@@ -898,15 +1599,17 @@ def find_bad_channels_autoreject_by_type_improved(
                 ar.fit(epochs_good)
                 reject_log = ar.get_reject_log(epochs_good)
 
-                # Per-channel bads from reject_log
+                # Per-channel tallies from reject_log.labels
                 bad_labels = []
-                if hasattr(reject_log, "labels") and isinstance(reject_log.labels, (list, np.ndarray)):
-                    for labs in reject_log.labels:
-                        for lbl in labs:
-                            if isinstance(lbl, str):
-                                bad_labels.append(lbl)
+                if hasattr(reject_log, "labels"):
+                    lab = reject_log.labels
+                    if isinstance(lab, (list, np.ndarray)):
+                        for labs in lab:
+                            for lbl in labs:
+                                if isinstance(lbl, str):
+                                    bad_labels.append(lbl)
 
-                # Count and threshold by consensus
+                # Consensus rule across epochs
                 n_epochs = len(reject_log.labels) if hasattr(reject_log, "labels") else len(epochs_good)
                 bads_ar = set()
                 if n_epochs > 0 and len(bad_labels) > 0:
@@ -914,11 +1617,12 @@ def find_bad_channels_autoreject_by_type_improved(
                     bads_ar = {ch for ch, ct in counts.items() if (ct / n_epochs) > consensus_thresh}
 
                 logger.info(
-                    f"AutoReject consensus>{consensus_thresh:.2f} → {len(bads_ar)} {typ.upper()} bads: {sorted(bads_ar)}")
+                    f"AutoReject consensus>{consensus_thresh:.2f} → {len(bads_ar)} {typ.upper()} bads: {sorted(bads_ar)}"
+                )
 
                 bads_final = list(set(bads_ransac) | bads_ar)
 
-                # Global bad epochs - IMPROVED: use sample indices for precision
+                # Global bad epochs (fraction of channels rejected per epoch)
                 global_bad_epochs = []
                 if hasattr(reject_log, "labels"):
                     rl = np.array([[bool(x) for x in row] for row in reject_log.labels], dtype=bool)
@@ -926,18 +1630,18 @@ def find_bad_channels_autoreject_by_type_improved(
                         frac_bad_per_epoch = rl.mean(axis=1)
                         bad_epoch_indices = np.where(frac_bad_per_epoch > global_epoch_thresh)[0]
 
-                        # Convert epoch indices to sample indices in ORIGINAL raw
+                        # Convert epoch start (in filtered copy) back to ORIGINAL raw sample indices
                         for epoch_idx in bad_epoch_indices:
-                            # Convert back to original raw sample indices
-                            sample_start = int(events[epoch_idx, 0])  # Sample index in filtered raw
-                            # Scale back to original sampling rate if needed
+                            sample_start = int(events[epoch_idx, 0])  # index in filtered copy
                             if resample_hz and raw.info['sfreq'] != resample_hz:
-                                scale_factor = raw.info['sfreq'] / resample_hz
+                                scale_factor = float(raw.info['sfreq']) / float(resample_hz)
                                 sample_start = int(sample_start * scale_factor)
                             global_bad_epochs.append(sample_start)
 
-                logger.info(f"Global bad epochs for {typ.upper()}: {len(global_bad_epochs)} "
-                            f"(threshold={global_epoch_thresh:.2f})")
+                logger.info(
+                    f"Global bad epochs for {typ.upper()}: {len(global_bad_epochs)} "
+                    f"(threshold={global_epoch_thresh:.2f})"
+                )
                 detected_bads[f"{typ}_global_bad_epochs"] = global_bad_epochs
                 all_global_bad_epochs.update(global_bad_epochs)
 
@@ -951,7 +1655,7 @@ def find_bad_channels_autoreject_by_type_improved(
         detected_bads[typ] = bads_final
         all_bad_channels.update(bads_final)
 
-    # Transfer results to ORIGINAL raw - IMPROVED annotation handling
+    # ---------- Apply results to ORIGINAL raw ----------
     # Update bad channels
     prev_bads = set(raw.info.get('bads', []))
     new_bads = sorted(set(all_bad_channels) - prev_bads)
@@ -971,21 +1675,14 @@ def find_bad_channels_autoreject_by_type_improved(
     # Remove old BAD_GlobalEpochs from ORIGINAL raw
     _remove_bad_epoch_anns(raw)
 
-    # Add NEW BAD_GlobalEpoch annotations using sample indices
+    # Add NEW BAD_GlobalEpoch annotations using sample indices (aligned to ORIGINAL raw)
     if len(all_global_bad_epochs) > 0:
-        # Determine stable orig_time for annotations
-        if raw.annotations is not None and raw.annotations.orig_time is not None:
-            base_orig = raw.annotations.orig_time
-        else:
-            base_orig = raw.info.get('meas_date', None)
+        # Determine a stable orig_time for annotations
+        base_orig = raw.annotations.orig_time if (raw.annotations is not None and raw.annotations.orig_time is not None) \
+                    else raw.info.get('meas_date', None)
 
-        # Convert sample indices to time (more precise than duration math)
-        sfreq = raw.info['sfreq']
-        onsets = []
-        for sample_idx in sorted(set(all_global_bad_epochs)):
-            time_sec = sample_idx / sfreq
-            onsets.append(time_sec)
-
+        sfreq = float(raw.info['sfreq'])
+        onsets = [int(samp) / sfreq for samp in sorted(set(all_global_bad_epochs))]
         durs = [duration] * len(onsets)
         descs = ["BAD_GlobalEpoch"] * len(onsets)
 
@@ -1002,163 +1699,8 @@ def find_bad_channels_autoreject_by_type_improved(
             raw.set_annotations(new_anns)
         logger.info(f"Added {len(new_anns)} BAD_GlobalEpoch annotations to ORIGINAL raw.")
 
-    # INTERACTIVE REVIEW with improved workflow
-    if interactive:
-        logger.info("🎮 Starting interactive review on filtered copy...")
-
-        # Mirror bads and annotations to viewer copy
-        raw_filt_all.info['bads'] = list(raw.info['bads'])
-
-        # Show current BAD_GlobalEpochs in viewer
-        if raw.annotations is not None and len(raw.annotations) > 0:
-            # Scale annotations to filtered copy timing
-            viewer_anns = []
-            filt_sfreq = raw_filt_all.info['sfreq']
-            orig_sfreq = raw.info['sfreq']
-            scale_factor = filt_sfreq / orig_sfreq if orig_sfreq != filt_sfreq else 1.0
-
-            for ann in raw.annotations:
-                if ann['description'] == "BAD_GlobalEpoch":
-                    scaled_onset = ann['onset'] * scale_factor
-                    scaled_duration = ann['duration'] * scale_factor
-                    viewer_anns.append({
-                        'onset': scaled_onset,
-                        'duration': scaled_duration,
-                        'description': 'BAD_GlobalEpoch'
-                    })
-
-            if viewer_anns:
-                if raw_filt_all.annotations is None:
-                    raw_filt_all.set_annotations(Annotations(onset=[], duration=[], description=[]))
-
-                view_orig = raw.annotations.orig_time if raw.annotations is not None else raw.info.get('meas_date',
-                                                                                                       None)
-                anns_view = Annotations(
-                    onset=[a['onset'] for a in viewer_anns],
-                    duration=[a['duration'] for a in viewer_anns],
-                    description=[a['description'] for a in viewer_anns],
-                    orig_time=view_orig
-                )
-                raw_filt_all.set_annotations(raw_filt_all.annotations + anns_view)
-
-        # Enhanced interactive plotting with better error handling
-        try:
-            logger.info("🖥️  Opening interactive plot window...")
-            logger.info("📋 Instructions:")
-            logger.info("   - Click channels to mark/unmark as bad")
-            logger.info("   - Click time segments to mark/unmark BAD_GlobalEpoch annotations")
-            logger.info("   - Use scroll wheel to zoom in/out")
-            logger.info("   - Close the plot window when done")
-
-            # Show plot with reasonable defaults
-            n_channels = min(32, len(raw_filt_all.ch_names))
-            raw_filt_all.plot(
-                n_channels=n_channels,
-                duration=30.0,  # Show 30 seconds at a time
-                scalings='auto',
-                show=True,
-                block=True,
-                title=f"Interactive Review - {len(raw_filt_all.info['bads'])} bad channels"
-            )
-
-            # Wait for user confirmation
-            print("\n" + "=" * 60)
-            print("🎯 INTERACTIVE REVIEW COMPLETE")
-            print("   - Close the plot window if you haven't already")
-            print("   - Your changes will be saved to the checkpoint")
-            print("=" * 60)
-            response = input("Press Enter to continue with your changes (or 'abort' to cancel): ").strip().lower()
-
-            if response == 'abort':
-                logger.info("❌ User aborted interactive review - keeping original results")
-                del raw_filt_all
-                return detected_bads
-
-        except Exception as e:
-            logger.error(f"Interactive plotting failed: {e}")
-            logger.info("⚠️  Continuing with automated results only")
-            del raw_filt_all
-            return detected_bads
-
-        # Transfer user-reviewed bad channels back to ORIGINAL raw
-        final_bads = list(raw_filt_all.info.get('bads', []))
-        original_bads = set(raw.info.get('bads', []))
-        reviewed_bads = set(final_bads)
-
-        added_bads = reviewed_bads - original_bads
-        removed_bads = original_bads - reviewed_bads
-
-        if added_bads:
-            logger.info(f"✅ User added bad channels: {sorted(added_bads)}")
-        if removed_bads:
-            logger.info(f"🔄 User rescued channels: {sorted(removed_bads)}")
-
-        raw.info['bads'] = sorted(final_bads)
-
-        # Transfer user-reviewed BAD_GlobalEpochs back to ORIGINAL raw
-        _remove_bad_epoch_anns(raw)
-
-        if raw_filt_all.annotations is not None and len(raw_filt_all.annotations) > 0:
-            gb_annots = [ann for ann in raw_filt_all.annotations if ann['description'] == "BAD_GlobalEpoch"]
-
-            if gb_annots:
-                # Convert back to original timeline
-                orig_sfreq = raw.info['sfreq']
-                filt_sfreq = raw_filt_all.info['sfreq']
-                scale_factor = orig_sfreq / filt_sfreq if filt_sfreq != orig_sfreq else 1.0
-
-                final_onsets = []
-                final_durations = []
-                for ann in gb_annots:
-                    scaled_onset = ann['onset'] * scale_factor
-                    scaled_duration = ann['duration'] * scale_factor
-                    final_onsets.append(scaled_onset)
-                    final_durations.append(scaled_duration)
-
-                if final_onsets:
-                    base_orig = raw.annotations.orig_time if raw.annotations is not None else raw.info.get('meas_date',
-                                                                                                           None)
-                    anns_final = Annotations(
-                        onset=final_onsets,
-                        duration=final_durations,
-                        description=["BAD_GlobalEpoch"] * len(final_onsets),
-                        orig_time=base_orig
-                    )
-
-                    if raw.annotations is not None and len(raw.annotations) > 0:
-                        combined = mne.Annotations(
-                            onset=list(raw.annotations.onset) + list(anns_final.onset),
-                            duration=list(raw.annotations.duration) + list(anns_final.duration),
-                            description=list(raw.annotations.description) + list(anns_final.description),
-                            orig_time=raw.annotations.orig_time
-                        )
-                        raw.set_annotations(combined)
-                    else:
-                        raw.set_annotations(anns_final)
-
-                    logger.info(f"✅ Committed {len(anns_final)} user-reviewed BAD_GlobalEpoch annotations")
-                else:
-                    logger.info("🗑️  User removed all BAD_GlobalEpoch annotations")
-            else:
-                logger.info("🗑️  No BAD_GlobalEpoch annotations after user review")
-
-        # Update detected_bads with final results for caller
-        final_bad_epochs = []
-        if raw.annotations is not None:
-            sfreq = raw.info['sfreq']
-            for ann in raw.annotations:
-                if ann['description'] == "BAD_GlobalEpoch":
-                    sample_idx = int(ann['onset'] * sfreq)
-                    final_bad_epochs.append(sample_idx)
-
-        for typ in which_types:
-            detected_bads[f"{typ}_global_bad_epochs"] = sorted(set(final_bad_epochs))
-
-        logger.info("🎉 Interactive review completed successfully!")
-
-    # Cleanup filtered copy
+    # Cleanup filtered copy and return
     del raw_filt_all
-
     return detected_bads
 
 def qc_meg_raw(raw: mne.io.Raw, plots_dir: str, hf_band: tuple = (250, 400)):
@@ -1341,14 +1883,14 @@ def bitwise_events(raw: mne.io.Raw, mask: int = 0xFFFF, min_high: int = 2, min_o
                 last_rise = r[0]
     return np.array(sorted(events), dtype=int)
 
-def apply_final_filter_and_cleanup(raw: mne.io.Raw, config: dict) -> mne.io.Raw:
+def apply_final_filter_and_cleanup(raw: mne.io.Raw, cfg: dict) -> mne.io.Raw:
     """
     Applies optional highpass/lowpass filtering, resampling, and
     drops specified channel types or name patterns before saving.
 
     Controlled entirely by the 'final_filter' section of the YAML config.
     """
-    final_cfg = config.get("final_filter", {})
+    final_cfg = cfg.get("final_filter", {})
     raw_proc = raw.copy()
 
     # 1. Drop unwanted channels by prefix (e.g., HPI*, HLC*, EEG061)
