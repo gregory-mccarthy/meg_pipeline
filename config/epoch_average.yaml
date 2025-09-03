@@ -1,0 +1,56 @@
+# Root directory of your BIDS dataset
+bids_root: "/Users/gm33/data/sep"
+
+# List of input files to process
+inputs:
+  - subject: "005"
+    session: "1"
+    task: "mns"
+    run: "01"
+  - subject: "005"
+    session: "1"
+    task: "mns"
+    run: "02"
+
+# Default epoch window for all conditions (used if not overridden below)
+tmin: -0.1         # -100 ms
+tmax: 0.4          # 400 ms
+baseline: [null, 0.0]
+
+# Toggle artifact rejection thresholds
+use_reject: true
+
+artifact_suppression:
+  window: [-0.005, 0.005]
+  channel_types: ["mag", "grad", "eeg"]
+
+reject:
+  mag: 4e-12
+  grad: 4000e-13
+  eeg: 100e-6
+
+filter:
+  l_freq: 0.1
+  h_freq: 200.0
+
+# Event codes and named conditions for epoching (basic conditions)
+conditions:
+  LMN: "16384"
+  RMN: "32768"
+
+# Composite conditions: user-labeled, arbitrary expressions
+composites:
+  sum_LMN_RMN:
+    expr: "LMN + RMN"
+  diff_LMN_RMN:
+    expr: "LMN - RMN"
+  # Example: weighted sum
+  weighted:
+    expr: "0.7*LMN + 0.3*RMN"
+
+# Per-condition epoch windows (add per-condition baseline if needed)
+epoch_windows:
+  LMN:   { tmin: -0.1, tmax: 0.4 }
+  RMN:   { tmin: -0.1, tmax: 0.4 }
+  # You can add a per-condition baseline like:
+  # LMN:   { tmin: -0.1, tmax: 0.3, baseline: [null, 0.0] }

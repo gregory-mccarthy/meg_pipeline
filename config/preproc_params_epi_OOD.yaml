@@ -1,0 +1,105 @@
+# MEG/EEG Preprocessing - OOD Configuration
+# Runs Stage 1 and Stage 2 entirely on HPC using OOD
+# HPC-only processing: automated artifact rejection, checkpoint creation, exit
+# Stage 2 interactive review handled separately on local workstation
+
+# BIDS Dataset
+subject: "010MPA"
+session: "01"
+run: "01"
+task: "stimulation"
+bids_root: /gpfs/milgram/scratch/mccarthy/gm33/BIDS/epi
+
+# Remote Processing
+remote_io:
+  enabled: false
+
+# Signal Processing
+head_movement:
+  enabled: true
+line_freq: 60.0
+stim_include_mask: 0xC000
+head_position_origin: null
+
+# Maxwell Filtering Calibration
+calibration_file: cals/sss_cal_factory_20230619.dat
+cross_talk_file: cals/ct_sparse_triux2.fif
+
+# EEG Configuration
+eeg_handling:
+  montage: montage/EasyCap_53.sfp
+
+# Interactive Controls
+interactive_bad_channels: false
+manual_bad_channels: []
+ica_exclude_eeg: []
+ica_exclude_meg: []
+
+# Autoreject Artifact Detection
+autoreject:
+  enabled: true
+  which_types: [eeg, mag]
+  filter:
+    highpass: 1.0
+    lowpass: 40.0
+    resample_hz: null
+  epoch:
+    duration: 2.0
+    tmin: 0.0
+    tmax: 2.0
+  cv_folds: 5
+  thresh_method: 'random_search'
+  n_interpolate: [0]
+  consensus_thresh: 0.3
+  global_epoch_thresh: 0.5
+
+# ICA Preprocessing
+ica_preprocessing:
+  eeg:
+    highpass: 1.0
+    lowpass: 40.0
+    resample_hz: 200
+    max_ica_duration_sec: 1800
+    interactive: true
+    random_state: 97
+  meg:
+    highpass: 1.0
+    lowpass: 40.0
+    resample_hz: 200
+    max_ica_duration_sec: 1800
+    interactive: false
+    random_state: 97
+
+# Final Processing
+final_filter:
+  highpass: null
+  lowpass: null
+  resample_hz: null
+  drop_channel_types:
+    - hpi
+    - hlc
+    - coil
+
+# Checkpoint System
+checkpoint:
+  enabled: true
+  exit_after_checkpoint: true
+  derivatives_root: derivatives
+  pipeline_name: preprocessing
+  atomic_writes: true
+  allow_resume_with_different_yaml: false
+  validate_checkpoint_integrity: true
+  backup_before_overwrite: false
+  max_checkpoint_age_hours: 168
+
+# Reproducibility
+repro:
+  random_state_global: 42
+  record_environment: true
+
+# Metadata Fixes
+metadata_fixes:
+  fix_non_eeg_channels: {}
+  fix_generic: {}
+  expert_patch: |
+    print("✅ Expert patch executed successfully.")

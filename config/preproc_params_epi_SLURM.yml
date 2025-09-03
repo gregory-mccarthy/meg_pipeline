@@ -1,19 +1,15 @@
-# ============================================================
-# Gold-Standard MEG/EEG Preprocessing — SLURM (Stage 1 only)
-# Runs on HPC with data on GPFS. Writes checkpoint + exits.
-# ============================================================
+# MEG/EEG Preprocessing - SLURM Stage 1 Configuration
+# Runs Stage 1 only on HPC using SLURM batch processing
+# Automated artifact rejection, writes checkpoint, exits
 
-# -------- BIDS IDENTIFIERS --------
+# BIDS Dataset
 subject: "010MPA"
 session: "01"
 run: "01"
 task: "stimulation"
-
-# Data live on GPFS; no local caching in SLURM run
 bids_root: /gpfs/milgram/scratch/mccarthy/gm33/BIDS/epi
 
-# -------- HYBRID / REMOTE I/O --------
-# Disabled on HPC: we read/write directly on GPFS.
+# Remote Processing
 remote_io:
   enabled: false
   hpc_host: transfer-milgram.ycrc.yale.edu
@@ -21,40 +17,31 @@ remote_io:
   remote_bids_root: /gpfs/milgram/scratch/mccarthy/gm33/BIDS/epi
   local_temp_dir: ./temp
 
-# -------- HEAD MOVEMENT COMPENSATION --------
+# Signal Processing
 head_movement:
   enabled: true
+line_freq: 60.0
+stim_include_mask: 0xC000
+head_position_origin: null
 
-# -------- MAXWELL (tSSS) CALIBRATION FILES --------
-# (resolved relative to repo root if not absolute)
+# Maxwell Filtering Calibration
 calibration_file: cals/sss_cal_factory_20230619.dat
 cross_talk_file: cals/ct_sparse_triux2.fif
 
-# -------- LINE-NOISE NOTCH --------
-line_freq: 60.0
-
-# -------- STIM EVENTS (bitmask) --------
-stim_include_mask: 0xC000   # bits 14 & 15
-
-# -------- HEAD POSITION ORIGIN --------
-head_position_origin: null  # use dev_head_t from file
-
-# -------- EEG HANDLING --------
+# EEG Configuration
 eeg_handling:
   montage: montage/EasyCap_53.sfp
 
-# -------- INTERACTIVE FLAGS --------
-# Stage 1 must be non-interactive on SLURM
+# Interactive Controls
 interactive_bad_channels: false
-
-# Optional manual overrides (not used in Stage 1)
 manual_bad_channels: []
 ica_exclude_eeg: []
 ica_exclude_meg: []
 
-# -------- AUTOREJECT (Stage 1 compute only) --------
+# Autoreject Artifact Detection
 autoreject:
   enabled: true
+  which_types: [eeg, mag]
   filter:
     highpass: 1.0
     lowpass: 40.0
@@ -63,12 +50,13 @@ autoreject:
     duration: 2.0
     tmin: 0.0
     tmax: 2.0
+  cv_folds: 5
+  thresh_method: 'random_search'
+  n_interpolate: [0]
   consensus_thresh: 0.3
   global_epoch_thresh: 0.5
-  which_types: [eeg, mag]
 
-# -------- ICA PREPROCESSING --------
-# Not reached in Stage 1, but keep for consistency
+# ICA Preprocessing
 ica_preprocessing:
   eeg:
     highpass: 1.0
@@ -85,35 +73,33 @@ ica_preprocessing:
     interactive: false
     random_state: 97
 
-# -------- FINAL FILTER / DOWNSAMPLING --------
-# Not executed in Stage 1
+# Final Processing
 final_filter:
   highpass: null
   lowpass: null
   resample_hz: null
   drop_channel_types: [hpi, hlc, coil]
 
-# -------- OPTIONAL METADATA FIXES --------
+# Checkpoint System
+checkpoint:
+  enabled: true
+  exit_after_checkpoint: true
+  derivatives_root: derivatives
+  pipeline_name: preprocessing
+  atomic_writes: true
+  allow_resume_with_different_yaml: true
+  validate_checkpoint_integrity: true
+  backup_before_overwrite: false
+  max_checkpoint_age_hours: 168
+
+# Reproducibility
+repro:
+  random_state_global: 42
+  record_environment: true
+
+# Metadata Fixes
 metadata_fixes:
   fix_non_eeg_channels: {}
   fix_generic: {}
   expert_patch: |
     print("✅ Expert patch executed successfully.")
-
-# -------- CHECKPOINT / RESUME --------
-# Critical: exit after Stage 1 checkpoint
-checkpoint:
-  enabled: true
-  exit_after_checkpoint: true         # <-- Stage 1 then exit
-  derivatives_root: derivatives
-  pipeline_name: preprocessing
-  atomic_writes: true
-  allow_resume_with_different_yaml: true   # allow Stage 2 YAML to differ
-  validate_checkpoint_integrity: true
-  backup_before_overwrite: false
-  max_checkpoint_age_hours: 168
-
-# -------- REPRODUCIBILITY --------
-repro:
-  random_state_global: 42
-  record_environment: true
