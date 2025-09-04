@@ -1,29 +1,36 @@
 #!/usr/bin/env python3
-# ==========================================================
-# MNE-PYTHON PREPROCESSING PIPELINE — HYBRID-READY MAIN
-# (integrates HybridTransferManager with minimal code churn)
-# ==========================================================
 """
-This main preserves your local-only flow exactly as before, and
-adds optional hybrid behavior:
+MEG/EEG PREPROCESSING PIPELINE - HYBRID TRANSFER CAPABLE
 
-HYBRID MODE (enabled only when requested in YAML):
-  - Prefetch (rsync) raw + any derivatives (parproc) from HPC
-    to ./temp/bids using HybridTransferManager.fetch_all_bids_data()
-  - Run Stage 1 and/or Stage 2 locally using the LOCAL temp BIDS
-  - Push derivatives (including parproc + preproc) back to HPC at end
-    using HybridTransferManager.push_results()
+A two-stage preprocessing pipeline for MEG/EEG data using MNE-Python.
+Supports both local processing and hybrid mode with HPC data transfer.
+
+HYBRID MODE:
+  - Transfers raw data and derivatives from HPC to local temporary directory
+  - Executes preprocessing stages locally using transferred data
+  - Transfers processed results back to HPC upon completion
 
 LOCAL MODE:
-  - No transfer manager is used. Behavior unchanged.
+  - Processes data directly from local BIDS directory
+  - No data transfer operations
 
-YAML keys (compatible with your earlier examples):
+YAML Configuration Keys:
   remote_io:
     enabled: true
     hpc_host: transfer-milgram.ycrc.yale.edu
     hpc_user: gm33
     remote_bids_root: /gpfs/milgram/scratch/mccarthy/gm33/BIDS/epi
     local_temp_dir: ./temp
+
+PIPELINE STAGES:
+  Stage 1: Data loading, Maxwell filtering, bad channel detection, checkpoint creation
+  Stage 2: Interactive review, ICA processing, event detection, final filtering
+
+Output Artifacts:
+  - Preprocessed MEG/EEG data in BIDS format
+  - ICA decomposition files for MEG and EEG
+  - Quality control plots and metrics
+  - Comprehensive processing logs in YAML and JSON formats
 """
 
 import os
@@ -37,57 +44,55 @@ import mne
 import json
 import numpy as np
 import matplotlib
-# Choose an interactive backend when a display is available; fall back to Agg in headless/SLURM
+
+
 def _in_slurm() -> bool:
     return any(k in os.environ for k in ("SLURM_JOB_ID", "SLURM_JOB_NAME", "SLURM_SUBMIT_DIR"))
 
+
 def _has_display() -> bool:
-    # On macOS, a window server is present when running locally.
     if sys.platform.startswith("darwin"):
         return True
-    # On Linux (e.g., OOD), DISPLAY or WAYLAND_DISPLAY indicates a GUI session
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
-# Allow an explicit override if you ever need it:
+
 _override = os.environ.get("MPLBACKEND_OVERRIDE") or os.environ.get("MPLBACKEND")
 
 if _override:
     matplotlib.use(_override, force=True)
 elif _in_slurm() or not _has_display():
-    matplotlib.use("Agg", force=True)   # headless: no interactive windows
+    matplotlib.use("Agg", force=True)
 else:
-    matplotlib.use("QtAgg", force=True) # interactive (Mac, OOD desktop)
+    matplotlib.use("QtAgg", force=True)
 
-# ---------- utils import (support v3 or v2) ----------
 try:
     import meg_pipeline_utils_v4 as utils
 except ImportError:
     import meg_pipeline_utils as utils
 
-# ---------- optional transfer manager (only used in hybrid) ----------
 try:
     from transfer_manager import HybridTransferManager
 except ImportError:
-    HybridTransferManager = None  # OK for local-only mode
+    HybridTransferManager = None
 
-# ---------- logging/version ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("pipeline")
 PIPELINE_VERSION = "1.2"
-CHECKPOINT_VERSION = "1.0"  # checkpoint format compatibility
+CHECKPOINT_VERSION = "1.0"
 
 
-# ==========================================================
-# PIPELINE STAGE DETECTION (unchanged logic, uses p["bids_root"])
-# ==========================================================
 def detect_pipeline_stage(yaml_path: str, p: dict, force_stage: str = None):
     """
-    Decide whether to start at Stage 1 (no checkpoint) or Stage 2 (resume from checkpoint).
-    Looks for parproc fif + manifest under:
+    Determine whether to execute Stage 1 or resume from Stage 2 checkpoint.
+
+    Searches for existing checkpoint files in BIDS derivatives structure:
       {bids_root}/derivatives/{pipeline_name}/sub-*/ses-*/meg/*_desc-parproc_meg.fif
+
+    Returns:
+        tuple: (stage_name, checkpoint_path) where stage_name is 'stage1' or 'stage2'
     """
     if force_stage:
-        logger.info(f"🔧 Forcing pipeline stage: {force_stage}")
+        logger.info(f"Pipeline stage forced: {force_stage}")
         if force_stage == "stage1":
             return ("stage1", None)
         elif force_stage != "stage2":
@@ -121,8 +126,7 @@ def detect_pipeline_stage(yaml_path: str, p: dict, force_stage: str = None):
     manifest_path = parproc_fif.with_name(parproc_fif.stem + "_manifest.yaml")
 
     if parproc_fif.exists() and manifest_path.exists():
-        logger.info(f"🔄 Checkpoint detected: {parproc_fif}")
-        # basic version/age check (non-interactive in stage detect)
+        logger.info(f"Checkpoint detected: {parproc_fif}")
         try:
             man = utils.load_yaml(str(manifest_path))
             chk_version = man.get("checkpoint_version", "0.0")
@@ -137,8 +141,9 @@ def detect_pipeline_stage(yaml_path: str, p: dict, force_stage: str = None):
         logger.error(f"Cannot force Stage 2: checkpoint not found at {parproc_fif}")
         sys.exit(1)
 
-    logger.info("🆕 No checkpoint found → Stage 1")
+    logger.info("No checkpoint found, starting from Stage 1")
     return ("stage1", None)
+
 
 def validate_checkpoint_integrity(checkpoint_path: Path, manifest_path: Path) -> bool:
     try:
@@ -162,17 +167,53 @@ def validate_checkpoint_integrity(checkpoint_path: Path, manifest_path: Path) ->
         return False
 
 
-# ==========================================================
-# STAGE 1: Data loading, Maxwell filtering, and checkpoint creation
-# ==========================================================
 def run_stage1_pipeline(yaml_path: str, p: dict):
     """
-    Stage 1: Load raw data, apply Maxwell filtering, detect bad channels,
-    and create checkpoint for Stage 2 processing.
+    STAGE 1: DATA LOADING AND MAXWELL FILTERING
 
-    This stage is designed to run headless on HPC systems and creates:
-    - Partially processed data file (checkpoint FIF)
-    - Comprehensive manifest file with all Stage 1 results
+    1. Data Loading and Validation
+       - Load raw MEG/EEG data from BIDS structure
+       - Validate file integrity and metadata
+
+    2. Head Movement Analysis
+       - Load or compute head position data for Maxwell filtering
+       - Calculate movement statistics for quality assessment
+
+    3. EEG Channel Configuration
+       - Apply montage and channel setup
+       - Configure reference and electrode positions
+
+    4. Metadata Repairs
+       - Apply configuration-specified metadata corrections
+       - Ensure data integrity for downstream processing
+
+    5. Quality Control Assessment
+       - Generate power spectral density plots
+       - Compute baseline quality metrics
+
+    6. Maxwell Filtering (tSSS)
+       - Apply temporal Signal Space Separation
+       - Remove environmental noise and compensate for head movement
+       - Generate quality improvement metrics
+
+    7. Rank Estimation
+       - Compute empirical rank of MEG data after Maxwell filtering
+       - Essential for subsequent ICA processing
+
+    8. Notch Filtering
+       - Remove power line noise at fundamental and harmonic frequencies
+       - Apply to both MEG and EEG channels
+
+    9. Bad Channel Detection
+       - Use AutoReject to identify problematic channels
+       - Create checkpoint file for Stage 2 processing
+
+    10. Manifest Creation
+        - Generate comprehensive processing log
+        - Document all parameters and quality metrics
+
+    Returns:
+        tuple: (status, raw_data) where status is 'exit', 'continue', or error state
     """
     p["_cfg_path"] = yaml_path
     repo_root = Path(__file__).resolve().parent
@@ -193,13 +234,11 @@ def run_stage1_pipeline(yaml_path: str, p: dict):
     run = p.get("run")
     bids_root = p["bids_root"]
 
-    # Initialize containers for manifest data
     head_movement_stats = None
     empirical_rank = None
     eeg_setup_results = None
     metadata_repair_results = None
 
-    # ---------------- 2. Load Raw Data ----------------
     utils.log_section("2. Load Raw Data")
     bids_path = utils.BIDSPath(subject=subject, session=session, task=task, run=run,
                                datatype="meg", root=bids_root)
@@ -207,7 +246,6 @@ def run_stage1_pipeline(yaml_path: str, p: dict):
     raw_fif_path = raw.filenames[0]
     meg_dir = os.path.dirname(raw_fif_path)
 
-    # Store original recording metadata for manifest
     original_recording_info = {
         "raw_file_path": raw_fif_path,
         "original_sfreq": float(raw.info['sfreq']),
@@ -223,7 +261,6 @@ def run_stage1_pipeline(yaml_path: str, p: dict):
     pos_file_requested = expected_pos if os.path.exists(expected_pos) else None
     logger.info(f"Head position file: {pos_file_requested if pos_file_requested else 'Will compute if needed'}")
 
-    # ---------------- 3. Head Movement Analysis ----------------
     utils.log_section("3. Compute or Load Head Position")
     head_movement_cfg = p.get("head_movement", {})
     movement_enabled = head_movement_cfg.get("enabled", False)
@@ -237,10 +274,9 @@ def run_stage1_pipeline(yaml_path: str, p: dict):
             try:
                 head_pos_array = utils.mne.chpi.read_head_pos(head_pos_path)
 
-                # Calculate head movement statistics for manifest
                 if head_pos_array is not None and len(head_pos_array) > 0:
-                    translations_mm = head_pos_array[:, 1:4] * 1000  # Convert to mm
-                    rotations_deg = head_pos_array[:, 4:7] * (180 / np.pi)  # Convert to degrees
+                    translations_mm = head_pos_array[:, 1:4] * 1000
+                    rotations_deg = head_pos_array[:, 4:7] * (180 / np.pi)
 
                     head_movement_stats = {
                         "head_pos_file": head_pos_path,
@@ -266,7 +302,6 @@ def run_stage1_pipeline(yaml_path: str, p: dict):
             except Exception as e:
                 logger.warning(f"Could not read head position file: {head_pos_path}\n{e}")
 
-    # Setup output paths
     bids_path_deriv = bids_path.copy().update(
         root=Path(bids_root) / "derivatives" / p.get("checkpoint", {}).get("pipeline_name", "preprocessing"),
         suffix="meg", description="preproc", extension=".fif"
@@ -275,27 +310,21 @@ def run_stage1_pipeline(yaml_path: str, p: dict):
     plots_dir = os.path.join(os.path.dirname(out_fif), "plots")
     os.makedirs(plots_dir, exist_ok=True)
 
-    # Save head movement plot if available
     if movement_enabled and head_pos_array is not None:
         utils.plot_head_movement(head_pos_array, plots_dir)
 
-    # ---------------- 4. EEG Channel Setup ----------------
     utils.log_section("4. EEG Channel Setup")
     eeg_setup_results = utils.prepare_eeg_channels(raw, str(checked_paths["montage"]), logger)
 
-    # ---------------- 5. Metadata Repairs ----------------
     utils.log_section("5. Metadata Repair")
     metadata_repair_results = utils.apply_metadata_repairs(raw, p.get('metadata_fixes', {}))
 
-    # ---------------- 6. Pre-processing Quality Control ----------------
     utils.log_section("6. PSD & RMS Diagnostics (Pre-filtering)")
     utils.qc_meg_raw(raw, plots_dir)
     utils.plot_psd_and_peaks(raw, "Raw PSD Before Maxwell", plots_dir)
 
-    # Compute comprehensive quality metrics before Maxwell filtering
     metrics_pre_maxwell = utils.compute_meg_quality_metrics(raw, "pre_maxwell")
 
-    # ---------------- 7. Maxwell Filtering (tSSS) ----------------
     utils.log_section("7. Maxwell Filter (tSSS)")
     raw = utils.apply_maxwell_filter(
         raw,
@@ -306,7 +335,6 @@ def run_stage1_pipeline(yaml_path: str, p: dict):
     )
     utils.plot_psd_and_peaks(raw, "After Maxwell", plots_dir)
 
-    # Compute quality metrics after Maxwell and calculate improvements
     metrics_post_maxwell = utils.compute_meg_quality_metrics(raw, "post_maxwell")
     maxwell_quality_metrics = utils.log_maxwell_quality_results(
         metrics_pre_maxwell,
@@ -314,7 +342,6 @@ def run_stage1_pipeline(yaml_path: str, p: dict):
         logger
     )
 
-    # Estimate MEG rank after Maxwell filtering
     utils.log_section("7b. Estimate MEG Rank After Maxwell")
     try:
         empirical_rank = mne.compute_rank(raw, picks='meg')
@@ -328,7 +355,6 @@ def run_stage1_pipeline(yaml_path: str, p: dict):
         logger.warning(f"Rank estimation failed: {e}")
         rank_info = {"error": str(e), "meg_rank": None}
 
-    # ---------------- 8. Notch Filtering ----------------
     utils.log_section("8. Notch Filter")
     line_freq = float(p.get("line_freq", 60.0))
     notch_freqs = [line_freq * i for i in range(1, 5)]
@@ -336,21 +362,18 @@ def run_stage1_pipeline(yaml_path: str, p: dict):
     raw.notch_filter(notch_freqs, picks=picks, method='fir', filter_length='auto')
     utils.plot_psd_and_peaks(raw, "After Maxwell and Notch", plots_dir)
 
-    # Store notch filtering parameters
     notch_filter_params = {
         "frequencies_hz": notch_freqs,
         "method": "fir",
         "n_channels_filtered": len(picks)
     }
 
-    # ---------------- 9. Bad Channel Detection (AutoReject + Checkpoint) ----------------
     utils.log_section("9. Bad Channel Detection with AutoReject (checkpoint)")
     p["_checkpoint_version"] = CHECKPOINT_VERSION
 
-    # Run Stage 1 AutoReject and create checkpoint
     try:
         checkpoint_path, stage1_ar_metadata = utils.run_autoreject_stage1(raw, p, bids_path, logger)
-        logger.info("✅ Stage 1 AutoReject and checkpoint creation completed")
+        logger.info("Stage 1 AutoReject and checkpoint creation completed")
 
     except Exception as e:
         logger.error(f"Stage 1 AutoReject/checkpoint creation failed: {e}")
@@ -359,7 +382,6 @@ def run_stage1_pipeline(yaml_path: str, p: dict):
             return ('exit', raw)
         logger.warning("Continuing without checkpoint - Stage 2 will not be possible")
 
-        # Create minimal metadata for manifest writing
         stage1_ar_metadata = {
             "checkpoint_path": None,
             "bads_detected": list(raw.info.get('bads', [])),
@@ -371,17 +393,14 @@ def run_stage1_pipeline(yaml_path: str, p: dict):
         }
         checkpoint_path = None
 
-    # Prepare metadata for manifest writing
     stage1_meta = {
         "artifacts": {
             "parproc_raw_fif": str(checkpoint_path) if checkpoint_path else None,
         },
         "results": stage1_ar_metadata
     }
-    # ---------------- 10. Create Comprehensive Stage 1 Manifest ----------------
     utils.log_section("10. Save Stage 1 Manifest")
 
-    # Collect all quality metrics
     quality_metrics = {}
     if 'metrics_pre_maxwell' in locals():
         quality_metrics['pre_maxwell'] = metrics_pre_maxwell
@@ -390,7 +409,6 @@ def run_stage1_pipeline(yaml_path: str, p: dict):
     if 'maxwell_quality_metrics' in locals():
         quality_metrics['maxwell_improvements'] = maxwell_quality_metrics
 
-    # Collect AutoReject results
     ar_results = {
         "bads_detected": list(raw.info.get('bads', [])),
         "n_bad_channels": len(raw.info.get('bads', [])),
@@ -399,12 +417,10 @@ def run_stage1_pipeline(yaml_path: str, p: dict):
     if stage1_meta and "results" in stage1_meta and "autoreject_details" in stage1_meta["results"]:
         ar_results["autoreject_details"] = stage1_meta["results"]["autoreject_details"]
 
-    # Resolve checkpoint file path
     checkpoint_file = None
     if stage1_meta and "artifacts" in stage1_meta:
         checkpoint_file = stage1_meta["artifacts"].get("parproc_raw_fif")
 
-    # Fallback path reconstruction
     if not checkpoint_file:
         bids_root = Path(p.get("bids_root", bids_path.root))
         derivatives_root = p.get("checkpoint", {}).get("derivatives_root", "derivatives")
@@ -429,7 +445,6 @@ def run_stage1_pipeline(yaml_path: str, p: dict):
 
         checkpoint_file = str(parproc_dir / f"{base}_desc-parproc_meg.fif")
 
-    # Write comprehensive Stage 1 manifest
     manifest_path = utils.write_stage1_manifest(
         raw=raw,
         cfg=p,
@@ -437,7 +452,6 @@ def run_stage1_pipeline(yaml_path: str, p: dict):
         checkpoint_file=checkpoint_file,
         autoreject_results=ar_results,
         quality_metrics=quality_metrics,
-        # NEW: Pass all the additional data we collected
         head_movement_stats=head_movement_stats,
         rank_info=rank_info,
         eeg_setup_results=eeg_setup_results,
@@ -448,42 +462,74 @@ def run_stage1_pipeline(yaml_path: str, p: dict):
         logger=logger,
     )
 
-    # Decide whether to stop after Stage 1 or continue to Stage 2
     exit_after = bool(p.get("checkpoint", {}).get("exit_after_checkpoint", False))
     status = 'exit' if exit_after else 'continue'
 
-    # Return based on checkpoint configuration
     if status == 'exit':
-        logger.info("✅ Stage 1 completed — checkpoint and manifest saved; exit as requested")
+        logger.info("Stage 1 completed, checkpoint and manifest saved, exit as requested")
         return ('exit', raw)
     elif status == 'continue':
-        logger.info("✅ Stage 1 completed — checkpoint and manifest saved")
+        logger.info("Stage 1 completed, checkpoint and manifest saved")
         return ('continue', raw)
 
-    # Safety fallback
     logger.error("Unexpected Stage 1 flow")
     return ('exit', raw)
 
 
-# ==========================================================
-# STAGE 2: Interactive review, ICA, and final processing
-# ==========================================================
 def run_stage2_pipeline(yaml_path: str, p: dict, checkpoint_path: Path):
     """
-    Stage 2: Resume from Stage 1 checkpoint, perform interactive review,
-    ICA, event detection, and final filtering. Create comprehensive final logs
-    that include all Stage 1 and Stage 2 processing information.
+    STAGE 2: INTERACTIVE PROCESSING AND FINALIZATION
 
-    This stage is designed to run interactively on desktop/laptop systems.
+    1. Checkpoint Validation and Loading
+       - Validate checkpoint file integrity
+       - Load Stage 1 manifest and processing results
+
+    2. Output Path Configuration
+       - Setup BIDS-compliant derivative file paths
+       - Create directory structure for outputs and plots
+
+    3. Interactive Bad Channel Review
+       - Allow manual review and modification of bad channel selections
+       - Update channel status based on expert judgment
+
+    4. Rank Estimation
+       - Compute data rank after bad channel modifications
+       - Validate rank for ICA processing requirements
+
+    5. ICA Processing - EEG
+       - Perform Independent Component Analysis on EEG channels
+       - Identify and remove artifact components
+
+    6. ICA Processing - MEG
+       - Perform Independent Component Analysis on MEG channels
+       - Identify and remove artifact components
+
+    7. Event Detection
+       - Extract stimulus and behavioral events from trigger channels
+       - Convert events to MNE annotations format
+
+    8. Final Filtering and Cleanup
+       - Apply final bandpass filtering
+       - Perform data cleanup operations
+
+    9. Data Output
+       - Save preprocessed data in BIDS format
+       - Generate ICA decomposition files
+
+    10. Comprehensive Logging
+        - Create detailed processing logs combining Stage 1 and Stage 2 results
+        - Generate both YAML and JSON format logs
+
+    11. Cleanup Operations
+        - Optional removal of checkpoint files
+        - Final validation of output integrity
     """
     p["_cfg_path"] = yaml_path
     p["_checkpoint_version"] = CHECKPOINT_VERSION
 
-    # ---------------- 1. Validate and Load Checkpoint ----------------
     utils.log_section("1. Validate and Load Stage 1 Checkpoint")
     manifest_path = checkpoint_path.with_name(checkpoint_path.stem + "_manifest.yaml")
 
-    # Validate checkpoint integrity
     if not validate_checkpoint_integrity(checkpoint_path, manifest_path):
         logger.error("Checkpoint validation failed")
         resp = input("Restart from Stage 1? (y/n): ").strip().lower()
@@ -492,12 +538,10 @@ def run_stage2_pipeline(yaml_path: str, p: dict, checkpoint_path: Path):
             return
         sys.exit(1)
 
-    # Read Stage 1 manifest - this contains all our Stage 1 processing results
     try:
         stage1_manifest = utils.load_yaml(str(manifest_path))
-        logger.info(f"✅ Loaded Stage 1 manifest: {manifest_path}")
+        logger.info(f"Loaded Stage 1 manifest: {manifest_path}")
 
-        # Log key Stage 1 info for context
         if "system_info" in stage1_manifest and "stage1" in stage1_manifest["system_info"]:
             stage1_system = stage1_manifest["system_info"]["stage1"]
             logger.info(f"Stage 1 completed on: {stage1_system.get('hostname', 'unknown')} "
@@ -507,7 +551,6 @@ def run_stage2_pipeline(yaml_path: str, p: dict, checkpoint_path: Path):
         logger.warning(f"Could not read manifest at {manifest_path}: {e}")
         stage1_manifest = {}
 
-    # Prepare YAML consistency check
     prior_yaml_sha = (stage1_manifest.get("inputs", {}) or {}).get("yaml_sha256")
     current_yaml_sha = None
     try:
@@ -518,16 +561,14 @@ def run_stage2_pipeline(yaml_path: str, p: dict, checkpoint_path: Path):
     except Exception as e:
         logger.warning(f"Could not compute SHA256 of current YAML: {e}")
 
-    # YAML audit information for final logs
     yaml_audit = {
         "prior_yaml_sha256": prior_yaml_sha,
         "current_yaml_sha256": current_yaml_sha,
         "yaml_changed": bool(prior_yaml_sha and current_yaml_sha and prior_yaml_sha != current_yaml_sha)
     }
     if yaml_audit["yaml_changed"]:
-        logger.warning("⚠️ YAML configuration has changed since Stage 1 checkpoint was created")
+        logger.warning("YAML configuration has changed since Stage 1 checkpoint was created")
 
-    # ---------------- 2. Setup Output Paths ----------------
     utils.log_section("2. Setup Output Paths")
     bids_path = utils.BIDSPath(
         subject=p["subject"], session=p.get("session"), task=p.get("task"), run=p.get("run"),
@@ -541,15 +582,12 @@ def run_stage2_pipeline(yaml_path: str, p: dict, checkpoint_path: Path):
     plots_dir = os.path.join(os.path.dirname(out_fif), "plots")
     os.makedirs(plots_dir, exist_ok=True)
 
-    # ---------------- 3. Interactive Bad Channel Review ----------------
     utils.log_section("3. Interactive Bad Channel Review")
 
-    # Run Stage 2 interactive review
     try:
         raw, stage2_ar_metadata = utils.run_interactive_review_stage2(checkpoint_path, p, logger)
-        logger.info("✅ Stage 2 interactive review completed")
+        logger.info("Stage 2 interactive review completed")
 
-        # Log summary of changes
         if stage2_ar_metadata.get("interactive_review_enabled", False):
             changes = stage2_ar_metadata.get("changes_made", {})
             added = changes.get("bad_channels_added", [])
@@ -569,7 +607,6 @@ def run_stage2_pipeline(yaml_path: str, p: dict, checkpoint_path: Path):
         if resp != 'y':
             sys.exit(1)
 
-        # Fall back to loading checkpoint directly
         logger.warning("Loading checkpoint without interactive review")
         try:
             raw = mne.io.read_raw_fif(str(checkpoint_path), preload=True, verbose="error")
@@ -585,12 +622,10 @@ def run_stage2_pipeline(yaml_path: str, p: dict, checkpoint_path: Path):
             logger.error(f"Failed to load checkpoint: {load_error}")
             sys.exit(1)
 
-    # Log current state after interactive review
     logger.info(f"Current state: {len(raw.ch_names)} channels, {raw.times[-1]:.1f}s duration")
     logger.info(f"Bad channels: {len(raw.info.get('bads', []))} - {raw.info.get('bads', [])}")
     logger.info(f"Annotations: {len(raw.annotations) if raw.annotations is not None else 0}")
 
-    # ---------------- 4. Rank Estimation (Stage 2) ----------------
     utils.log_section("4. MEG Rank Estimation")
     stage2_rank_info = None
     try:
@@ -607,7 +642,6 @@ def run_stage2_pipeline(yaml_path: str, p: dict, checkpoint_path: Path):
         logger.warning(f"Stage 2 rank estimation failed: {e}")
         stage2_rank_info = {"error": str(e)}
 
-    # ---------------- 5. ICA Processing ----------------
     utils.log_section("5. ICA: EEG")
     ica_eeg_cfg = p["ica_preprocessing"]["eeg"]
     eeg_exclude = []
@@ -646,7 +680,6 @@ def run_stage2_pipeline(yaml_path: str, p: dict, checkpoint_path: Path):
 
     utils.plot_psd_and_peaks(raw, "After ICA", plots_dir)
 
-    # ---------------- 7. Event Detection ----------------
     utils.log_section("7. Event Detection")
     event_detection_results = {}
     try:
@@ -685,11 +718,9 @@ def run_stage2_pipeline(yaml_path: str, p: dict, checkpoint_path: Path):
         logger.error(f"Event detection failed: {e}")
         event_detection_results = {"success": False, "error": str(e)}
 
-    # ---------------- 8. Final Filtering and Cleanup ----------------
     utils.log_section("8. Final Filter and Cleanup")
     final_filter_results = {}
     try:
-        # Store pre-filter state for comparison
         pre_filter_info = {
             "n_channels": len(raw.ch_names),
             "sfreq": float(raw.info['sfreq']),
@@ -708,19 +739,18 @@ def run_stage2_pipeline(yaml_path: str, p: dict, checkpoint_path: Path):
                 "duration_sec": float(raw.times[-1])
             }
         }
-        logger.info("✅ Final filtering completed")
+        logger.info("Final filtering completed")
     except Exception as e:
         logger.error(f"Final filtering failed: {e}")
         final_filter_results = {"success": False, "error": str(e)}
         if input("Save without final filtering? (y/n): ").strip().lower() != 'y':
             sys.exit(1)
 
-    # ---------------- 9. Save Final Data ----------------
     utils.log_section("9. Save Final Data")
     try:
         written_files = utils.write_bids_robust(raw, bids_path_deriv, overwrite=True, verbose=True)
         main_output_files = utils.get_all_bids_split_files(out_fif)
-        logger.info(f"✅ Saved: {out_fif}")
+        logger.info(f"Saved: {out_fif}")
     except Exception as e:
         logger.error(f"Failed to save final data: {e}")
         emergency = Path.cwd() / f"emergency_save_{p['subject']}.fif"
@@ -731,29 +761,24 @@ def run_stage2_pipeline(yaml_path: str, p: dict, checkpoint_path: Path):
             logger.error("Emergency save failed")
             sys.exit(1)
 
-    # Get ICA output files
     ica_output_files = []
     for ica_fif in [bids_path_ica_eeg.fpath, bids_path_ica_meg.fpath]:
         if Path(ica_fif).exists():
             ica_output_files += utils.get_all_bids_split_files(ica_fif)
-    ica_output_files = list(dict.fromkeys(ica_output_files))  # Remove duplicates
+    ica_output_files = list(dict.fromkeys(ica_output_files))
 
-    # ---------------- 10. Create Comprehensive Final Logs ----------------
     utils.log_section("10. Write Comprehensive Final Logs")
 
-    # Get Stage 2 system information
     stage2_system_info = utils.get_runtime_info()
     stage2_system_info["stage"] = "stage2"
     stage2_system_info["completed_utc"] = datetime.now(timezone.utc).isoformat()
 
-    # YAML audit information
     yaml_audit = {
         "prior_yaml_sha256": prior_yaml_sha,
         "current_yaml_sha256": current_yaml_sha,
         "yaml_changed": bool(prior_yaml_sha and current_yaml_sha and prior_yaml_sha != current_yaml_sha)
     }
 
-    # Extract and organize Stage 1 information from manifest
     stage1_system_info = stage1_manifest.get("system_info", {}).get("stage1", {})
     stage1_processing_results = stage1_manifest.get("processing_results", {})
     stage1_quality_metrics = stage1_manifest.get("quality_metrics", {})
@@ -761,7 +786,6 @@ def run_stage2_pipeline(yaml_path: str, p: dict, checkpoint_path: Path):
     stage1_parameters = stage1_manifest.get("parameters", {})
     stage1_inputs = stage1_manifest.get("inputs", {})
 
-    # Organize Stage 2 processing results
     stage2_processing_results = {
         "interactive_review": stage2_ar_metadata,
         "rank_estimation": stage2_rank_info or {},
@@ -770,25 +794,21 @@ def run_stage2_pipeline(yaml_path: str, p: dict, checkpoint_path: Path):
         "event_detection": event_detection_results,
         "final_filtering": final_filter_results
     }
-    # Create comprehensive final log
+
     comprehensive_log = {
-        # Header and version information
-        "log_version": "3.0",  # Updated version for comprehensive format
+        "log_version": "3.0",
         "pipeline_version": PIPELINE_VERSION,
         "checkpoint_version": CHECKPOINT_VERSION,
         "pipeline_stage": "complete",
         "created_utc": datetime.now(timezone.utc).isoformat(),
 
-        # System information - both stages
         "system_info": {
             "stage1": stage1_system_info,
             "stage2": stage2_system_info
         },
 
-        # Complete input information from Stage 1
         "inputs": stage1_inputs,
 
-        # Configuration parameters from both stages
         "parameters": {
             "stage1": stage1_parameters,
             "stage2": {
@@ -799,16 +819,13 @@ def run_stage2_pipeline(yaml_path: str, p: dict, checkpoint_path: Path):
             }
         },
 
-        # Complete processing results from both stages
         "processing_results": {
             "stage1": stage1_processing_results,
             "stage2": stage2_processing_results
         },
 
-        # Quality metrics (primarily from Stage 1, since that's where Maxwell filtering occurred)
         "quality_metrics": stage1_quality_metrics,
 
-        # Final data state
         "final_state": {
             "recording_duration_sec": float(raw.times[-1]),
             "sampling_frequency": float(raw.info['sfreq']),
@@ -826,7 +843,6 @@ def run_stage2_pipeline(yaml_path: str, p: dict, checkpoint_path: Path):
             }
         },
 
-        # Output files and artifacts
         "outputs": {
             "main_output_files": main_output_files,
             "ica_output_files": ica_output_files,
@@ -835,7 +851,6 @@ def run_stage2_pipeline(yaml_path: str, p: dict, checkpoint_path: Path):
             "checkpoint_artifacts": stage1_manifest.get("artifacts", {})
         },
 
-        # Executive summary for quick review
         "summary": {
             "subject": p["subject"],
             "session": p.get("session"),
@@ -858,7 +873,6 @@ def run_stage2_pipeline(yaml_path: str, p: dict, checkpoint_path: Path):
             }
         },
 
-        # YAML and provenance audit
         "provenance": {
             "yaml_audit": yaml_audit,
             "checkpoint_used": str(checkpoint_path),
@@ -866,7 +880,6 @@ def run_stage2_pipeline(yaml_path: str, p: dict, checkpoint_path: Path):
         }
     }
 
-    # Save both YAML and JSON versions
     out_log_yaml = Path(out_fif).with_name(Path(out_fif).stem + "_log.yaml")
     out_log_json = Path(out_fif).with_name(Path(out_fif).stem + "_log.json")
 
@@ -874,13 +887,12 @@ def run_stage2_pipeline(yaml_path: str, p: dict, checkpoint_path: Path):
         utils.save_yaml(str(out_log_yaml), utils.make_serializable(comprehensive_log))
         with open(out_log_json, "w") as f:
             json.dump(utils.make_serializable(comprehensive_log), f, indent=2)
-        logger.info(f"📋 Final logs written:")
+        logger.info(f"Final logs written:")
         logger.info(f"   YAML: {out_log_yaml}")
         logger.info(f"   JSON: {out_log_json}")
 
-        # Log key summary metrics
         summary = comprehensive_log["summary"]
-        logger.info(f"📊 Processing Summary:")
+        logger.info(f"Processing Summary:")
         logger.info(f"   Quality Grade: {summary.get('maxwell_quality_grade', 'N/A')}")
         logger.info(f"   Bad Channels: {summary.get('total_bad_channels', 0)}")
         logger.info(f"   Head Movement: {summary.get('max_head_movement_mm', 'N/A')} mm")
@@ -889,7 +901,6 @@ def run_stage2_pipeline(yaml_path: str, p: dict, checkpoint_path: Path):
     except Exception as e:
         logger.error(f"Failed to write comprehensive logs: {e}")
 
-    # ---------------- 11. Cleanup and Completion ----------------
     utils.log_section("11. Cleanup and Completion")
     if checkpoint_path.exists():
         resp = input("Remove checkpoint files? [y/N] ").strip().lower()
@@ -897,26 +908,31 @@ def run_stage2_pipeline(yaml_path: str, p: dict, checkpoint_path: Path):
             try:
                 checkpoint_path.unlink()
                 manifest_path.unlink()
-                logger.info("✅ Checkpoint files removed")
+                logger.info("Checkpoint files removed")
             except Exception as e:
                 logger.warning(f"Could not remove checkpoint files: {e}")
 
-    logger.info("🎉 Stage 2 completed successfully!")
-    logger.info(f"📁 Final output: {out_fif}")
-    logger.info(f"📋 Complete logs: {out_log_yaml}")
+    logger.info("Stage 2 completed successfully!")
+    logger.info(f"Final output: {out_fif}")
+    logger.info(f"Complete logs: {out_log_yaml}")
 
-# ==========================================================
-# HYBRID PREFETCH + PUSH GLUE
-# ==========================================================
+
 def maybe_hybrid_prefetch(cfg: dict) -> tuple[dict, bool, bool, str, str]:
     """
-    If remote_io.enabled, call HybridTransferManager to pull raw + derivatives.
-    Returns: (updated_config, hybrid_used, checkpoint_exists, local_bids_root, remote_bids_root)
+    Execute hybrid transfer prefetch operation if enabled in configuration.
+
+    Transfers raw data and any existing derivatives from remote HPC system
+    to local temporary directory for processing.
+
+    Args:
+        cfg: Pipeline configuration dictionary
+
+    Returns:
+        tuple: (updated_config, hybrid_used, checkpoint_exists, local_bids_root, remote_bids_root)
     """
     remote_io = cfg.get("remote_io", {})
     enabled = bool(remote_io.get("enabled", False))
 
-    # Backward-compatible fallbacks if user provided old keys at top level
     hpc_host = remote_io.get("hpc_host", cfg.get("hpc_host"))
     hpc_user = remote_io.get("hpc_user", cfg.get("hpc_user"))
     remote_bids_root = remote_io.get("remote_bids_root", cfg.get("bids_root"))
@@ -929,8 +945,7 @@ def maybe_hybrid_prefetch(cfg: dict) -> tuple[dict, bool, bool, str, str]:
         logger.error("remote_io.enabled=True but transfer_manager not importable")
         sys.exit(1)
 
-    # Instantiate manager and fetch
-    logger.info("🌐 HYBRID: Prefetching raw + derivatives to local temp (single Duo auth)")
+    logger.info("HYBRID: Prefetching raw + derivatives to local temp (single Duo auth)")
     tm = HybridTransferManager(hpc_host, hpc_user, local_temp_dir)
     try:
         local_bids_root, checkpoint_exists = tm.fetch_all_bids_data(
@@ -938,12 +953,11 @@ def maybe_hybrid_prefetch(cfg: dict) -> tuple[dict, bool, bool, str, str]:
             remote_bids_root
         )
     except Exception as e:
-        logger.exception("Hybrid prefetch failed"); sys.exit(1)
+        logger.exception("Hybrid prefetch failed");
+        sys.exit(1)
 
-    # Update config to point the pipeline at the LOCAL temp BIDS root
     new_cfg = dict(cfg)
-    new_cfg["bids_root"] = local_bids_root  # <<< CRITICAL: everything else works unchanged
-    # Also store for later push
+    new_cfg["bids_root"] = local_bids_root
     new_cfg["_hybrid_local_bids_root"] = local_bids_root
     new_cfg["_hybrid_remote_bids_root"] = remote_bids_root
     return (new_cfg, True, checkpoint_exists, local_bids_root, remote_bids_root)
@@ -951,7 +965,13 @@ def maybe_hybrid_prefetch(cfg: dict) -> tuple[dict, bool, bool, str, str]:
 
 def maybe_hybrid_push(cfg: dict):
     """
-    If we used hybrid prefetch, push derivatives back to HPC.
+    Execute hybrid transfer push operation to return processed data to HPC.
+
+    Transfers derivative files (both checkpoint and final preprocessed data)
+    from local temporary directory back to remote HPC system.
+
+    Args:
+        cfg: Pipeline configuration dictionary containing hybrid transfer parameters
     """
     if not cfg.get("_hybrid_local_bids_root") or not cfg.get("_hybrid_remote_bids_root"):
         return
@@ -967,63 +987,70 @@ def maybe_hybrid_push(cfg: dict):
     local_temp_dir = rio.get("local_temp_dir", cfg.get("temp_dir", "./temp"))
 
     tm = HybridTransferManager(hpc_host, hpc_user, local_temp_dir)
-    logger.info("☁️  HYBRID: Pushing derivatives (parproc + preproc) back to HPC")
+    logger.info("HYBRID: Pushing derivatives (parproc + preproc) back to HPC")
     try:
         exit_code = tm.push_results(local_bids_root, remote_bids_root,
                                     cfg["subject"], cfg.get("session"))
         if exit_code == 0:
-            logger.info("✅ Hybrid push complete")
+            logger.info("Hybrid push complete")
         else:
-            logger.warning(f"⚠️ Hybrid push finished with exit code {exit_code}")
+            logger.warning(f"Hybrid push finished with exit code {exit_code}")
     except Exception as e:
         logger.exception("Hybrid push failed")
 
 
-# ==========================================================
-# MAIN DISPATCH
-# ==========================================================
 def run_pipeline(yaml_path: str, force_stage: str = None):
+    """
+    Main pipeline execution function.
+
+    Coordinates the complete preprocessing workflow including:
+    - Configuration loading and validation
+    - Optional hybrid data transfer operations
+    - Stage detection and execution
+    - Result transfer back to HPC if applicable
+
+    Args:
+        yaml_path: Path to YAML configuration file
+        force_stage: Optional stage override ('stage1' or 'stage2')
+    """
     utils.log_section("1. Load Configuration and Detect Pipeline Stage")
     if not os.path.exists(yaml_path):
-        logger.error(f"Config file not found: {yaml_path}"); sys.exit(1)
+        logger.error(f"Config file not found: {yaml_path}");
+        sys.exit(1)
 
     try:
         p0 = utils.load_yaml(yaml_path)
     except Exception as e:
-        logger.error(f"Failed to load configuration: {e}"); sys.exit(1)
+        logger.error(f"Failed to load configuration: {e}");
+        sys.exit(1)
 
-    # Minimal validation
     for key in ["subject", "bids_root"]:
         if key not in p0 and not (key == "bids_root" and p0.get("remote_io", {}).get("enabled")):
             logger.error(f"Missing required configuration key: {key}")
             sys.exit(1)
 
-    # HYBRID PREFETCH (if enabled) — updates p["bids_root"] to local temp
     p, hybrid_used, checkpoint_present, local_bids_root, remote_bids_root = maybe_hybrid_prefetch(p0)
 
-    # Stage detection uses (possibly updated) p["bids_root"]
     stage, checkpoint_path = detect_pipeline_stage(yaml_path, p, force_stage)
-    logger.info(f"🎯 Running pipeline in {stage.upper()} mode")
+    logger.info(f"Running pipeline in {stage.upper()} mode")
 
-    # Stage 1
     if stage == "stage1":
         status, _ = run_stage1_pipeline(yaml_path, p)
         if status == 'exit':
-            logger.info("🎯 Stage 1 completed - exiting as requested"); sys.exit(0)
+            logger.info("Stage 1 completed - exiting as requested");
+            sys.exit(0)
         elif status == 'continue':
-            # rediscover checkpoint under the same (local) bids_root
             stage2, checkpoint_path = detect_pipeline_stage(yaml_path, p, None)
             if stage2 != "stage2" or checkpoint_path is None:
-                logger.error("Expected Stage 2 after Stage 1, but no checkpoint found"); sys.exit(1)
+                logger.error("Expected Stage 2 after Stage 1, but no checkpoint found");
+                sys.exit(1)
             stage = "stage2"
 
-    # Stage 2
     if stage == "stage2":
         run_stage2_pipeline(yaml_path, p, checkpoint_path)
-        # If hybrid, push results back to HPC
         if hybrid_used:
             maybe_hybrid_push(p)
-        logger.info("🎉 Pipeline completed successfully!")
+        logger.info("Pipeline completed successfully!")
         return
 
     logger.error(f"Unknown pipeline stage: {stage}")
@@ -1031,18 +1058,24 @@ def run_pipeline(yaml_path: str, force_stage: str = None):
 
 
 def parse_arguments():
+    """
+    Parse command line arguments for pipeline execution.
+
+    Returns:
+        argparse.Namespace: Parsed command line arguments
+    """
     parser = argparse.ArgumentParser(
         description="MEG/EEG Preprocessing Pipeline with Hybrid Transfer Support",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Local-only (no transfers):
+  # Local-only processing (no transfers):
   python pipeline.py config_local.yaml
 
-  # Hybrid: pull raw+derivatives to ./temp/bids, run both stages, push results back:
+  # Hybrid mode (pull raw+derivatives to ./temp/bids, run both stages, push results back):
   python pipeline.py config_hybrid.yaml
 
-  # Force a stage:
+  # Force specific stage execution:
   python pipeline.py config.yaml --force-stage stage2
         """
     )
@@ -1056,7 +1089,8 @@ Examples:
 if __name__ == "__main__":
     args = parse_arguments()
     if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG); logger.setLevel(logging.DEBUG)
+        logging.getLogger().setLevel(logging.DEBUG);
+        logger.setLevel(logging.DEBUG)
 
     print("=" * 60)
     print(f"MEG/EEG Preprocessing Pipeline v{PIPELINE_VERSION}")
