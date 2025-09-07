@@ -238,8 +238,9 @@ def run_autoreject_stage1(raw, cfg, bids_path, logger):
             epoch_settings=eset,
             consensus_thresh=consensus_thresh,
             global_epoch_thresh=global_epoch_thresh,
-            interactive=False,  # ALWAYS non-interactive in Stage 1
-            logger=logger
+            interactive=False,
+            logger=logger,
+            cfg=cfg,
         )
 
         ar_metadata = {
@@ -1406,33 +1407,7 @@ def find_bad_channels_autoreject_by_type(
     Detect bad channels (EEG RANSAC + AutoReject) and globally bad epochs, then
     write results back to the ORIGINAL raw object (bads + BAD_GlobalEpoch annotations).
 
-    This function is **Stage 1 only (headless)**:
-    - It ignores `interactive=True` and logs a warning, because all interactive
-      review is handled in Stage 2 (`run_interactive_review_stage2`).
-
-    Parameters
-    ----------
-    raw : mne.io.Raw
-        Original raw object. Will be modified in-place (bads + annotations).
-    which_types : tuple[str]
-        Channel types to analyze: any subset of ('eeg', 'mag', 'grad').
-    filter_settings : dict or None
-        {'highpass': float, 'lowpass': float, 'resample_hz': float|None}
-        Defaults: 1–40 Hz, no resample.
-    epoch_settings : dict or None
-        {'duration': float, 'tmin': float, 'tmax': float}
-        Defaults: duration=2.0, tmin=0.0, tmax=2.0
-    consensus_thresh : float
-        Channel marked bad if rejected in > consensus_thresh fraction of epochs.
-    global_epoch_thresh : float
-        Epoch marked bad if fraction of channels rejected > global_epoch_thresh.
-    interactive : bool
-        Ignored (Stage 1 only). Kept for API stability.
-    logger : logging.Logger or None
-        Logger to use.
-    cfg : dict or None
-        Full pipeline config (used to read `autoreject` sub-keys such as
-        n_interpolate, cv_folds, thresh_method).
+    Stage 1 (headless) only: `interactive` is ignored; Stage 2 handles UI.
 
     Returns
     -------
@@ -1441,8 +1416,9 @@ def find_bad_channels_autoreject_by_type(
           'eeg': [...], 'mag': [...], 'grad': [...],
           'eeg_global_bad_epochs': [sample_idx, ...], ...
         }
-        Note: *_global_bad_epochs are **sample indices in ORIGINAL raw**.
+        Note: *_global_bad_epochs are sample indices in ORIGINAL raw.
     """
+    import time
     import numpy as np
     from collections import Counter
     import logging
@@ -1451,6 +1427,8 @@ def find_bad_channels_autoreject_by_type(
 
     if logger is None:
         logger = logging.getLogger("pipeline")
+
+    t0 = time.perf_counter()
 
     # Warn and ignore interactive for Stage 1
     if interactive:
@@ -1476,9 +1454,31 @@ def find_bad_channels_autoreject_by_type(
     consensus_thresh = float(consensus_thresh)
     global_epoch_thresh = float(global_epoch_thresh)
 
+    # ---- Resolve AutoReject params from cfg (key fix) ----
+    ar_cfg = cfg.get("autoreject", {}) if cfg else {}
+    ar_n_interpolate = ar_cfg.get("n_interpolate", [0])
+    ar_cv = ar_cfg.get("cv_folds", 5)
+    ar_method = ar_cfg.get("thresh_method", "random_search")
+    ar_n_jobs = int(ar_cfg.get("n_jobs", 1))
+    ar_random_state = int(ar_cfg.get("random_state", 42))
+    ar_verbose = bool(ar_cfg.get("verbose", False))
+
+    logger.info(
+        f"[AutoReject params] cv={ar_cv}, method={ar_method}, "
+        f"n_interpolate={ar_n_interpolate}, n_jobs={ar_n_jobs}, random_state={ar_random_state}"
+    )
+    logger.info(
+        f"[AutoReject thresholds] consensus>{consensus_thresh:.2f}, global_epoch>{global_epoch_thresh:.2f}"
+    )
+
     detected_bads = {}
     all_bad_channels = set()
     all_global_bad_epochs = set()  # sample indices in ORIGINAL raw
+
+    # For summary stats (autodetect only = from AutoReject consensus, excluding RANSAC)
+    autodetect_bad_counts = {typ: 0 for typ in which_types}
+    autodetect_bad_channels_all = set()
+    global_bad_epoch_counts = {typ: 0 for typ in which_types}
 
     # Create filtered copy for detection
     logger.info(f"Creating filtered copy for bad detection: {l_freq}-{h_freq} Hz"
@@ -1562,9 +1562,9 @@ def find_bad_channels_autoreject_by_type(
             try:
                 from autoreject import Ransac
                 logger.info("Running RANSAC for EEG channels...")
-                ransac = Ransac(n_jobs=1, random_state=42)
+                ransac = Ransac(n_jobs=ar_n_jobs, random_state=ar_random_state)
                 ransac.fit(epochs)
-                bads_ransac = list(ransac.bad_chs_)
+                bads_ransac = list(getattr(ransac, "bad_chs_", []))
                 logger.info(f"RANSAC identified {len(bads_ransac)} bad EEG channels: {bads_ransac}")
             except Exception as e:
                 logger.warning(f"RANSAC failed for EEG: {e}")
@@ -1583,54 +1583,67 @@ def find_bad_channels_autoreject_by_type(
         else:
             try:
                 from autoreject import AutoReject
-                logger.info(f"Running AutoReject on {len(picks_good)} good {typ.upper()} channels...")
+                logger.info(
+                    f"Running AutoReject on {len(picks_good)} good {typ.upper()} channels "
+                    f"(cv={ar_cv}, method={ar_method}, n_interp={ar_n_interpolate})..."
+                )
 
                 epochs_good = epochs.copy().pick_channels(picks_good)
-                # AutoReject config params
-                ar_cfg = cfg.get("autoreject", {}) if cfg else {}
+
                 ar = AutoReject(
-                    n_interpolate=ar_cfg.get("n_interpolate", [0]),
-                    cv=ar_cfg.get("cv_folds", 5),
-                    thresh_method=ar_cfg.get("thresh_method", "random_search"),
+                    n_interpolate=ar_n_interpolate,
+                    cv=ar_cv,
+                    thresh_method=ar_method,
                     consensus=None,
-                    n_jobs=1,
-                    random_state=42
+                    n_jobs=ar_n_jobs,
+                    random_state=ar_random_state,
+                    verbose=ar_verbose
                 )
                 ar.fit(epochs_good)
                 reject_log = ar.get_reject_log(epochs_good)
 
-                # Per-channel tallies from reject_log.labels
-                bad_labels = []
-                if hasattr(reject_log, "labels"):
-                    lab = reject_log.labels
-                    if isinstance(lab, (list, np.ndarray)):
-                        for labs in lab:
-                            for lbl in labs:
-                                if isinstance(lbl, str):
-                                    bad_labels.append(lbl)
-
-                # Consensus rule across epochs
-                n_epochs = len(reject_log.labels) if hasattr(reject_log, "labels") else len(epochs_good)
-                bads_ar = set()
-                if n_epochs > 0 and len(bad_labels) > 0:
-                    counts = Counter(bad_labels)
-                    bads_ar = {ch for ch, ct in counts.items() if (ct / n_epochs) > consensus_thresh}
+                # --- AutoReject "autodetect" consensus (EXCLUDING RANSAC) ---
+                # prefer boolean labels (n_epochs, n_channels); fall back defensively if needed
+                bad_consensus = set()
+                n_epochs = 0
+                if hasattr(reject_log, "labels") and reject_log.labels is not None:
+                    labels = np.array(reject_log.labels)
+                    if labels.ndim == 2:  # boolean matrix expected
+                        n_epochs = labels.shape[0]
+                        frac_bad_by_chan = labels.mean(axis=0)
+                        bad_consensus = {
+                            epochs_good.ch_names[i] for i, frac in enumerate(frac_bad_by_chan)
+                            if frac > consensus_thresh
+                        }
+                    else:
+                        # Very defensive fallback (older structures)
+                        n_epochs = len(labels)
+                        # Keep your original Counter approach for compatibility
+                        bad_labels = []
+                        for row in labels:
+                            for val in row:
+                                if isinstance(val, str):
+                                    bad_labels.append(val)
+                        if n_epochs > 0 and bad_labels:
+                            counts = Counter(bad_labels)
+                            bad_consensus = {
+                                ch for ch, ct in counts.items() if (ct / n_epochs) > consensus_thresh
+                            }
 
                 logger.info(
-                    f"AutoReject consensus>{consensus_thresh:.2f} → {len(bads_ar)} {typ.upper()} bads: {sorted(bads_ar)}"
+                    f"AutoReject consensus>{consensus_thresh:.2f} → "
+                    f"{len(bad_consensus)} {typ.upper()} bads (autodetect): {sorted(bad_consensus)}"
                 )
 
-                bads_final = list(set(bads_ransac) | bads_ar)
-
-                # Global bad epochs (fraction of channels rejected per epoch)
+                # --- Global bad epochs for this type (fraction of channels bad per epoch) ---
                 global_bad_epochs = []
-                if hasattr(reject_log, "labels"):
-                    rl = np.array([[bool(x) for x in row] for row in reject_log.labels], dtype=bool)
-                    if rl.ndim == 2 and rl.shape[0] == n_epochs:
-                        frac_bad_per_epoch = rl.mean(axis=1)
+                if hasattr(reject_log, "labels") and reject_log.labels is not None:
+                    labels = np.array(reject_log.labels)
+                    if labels.ndim == 2 and labels.shape[0] > 0:
+                        frac_bad_per_epoch = labels.mean(axis=1)
                         bad_epoch_indices = np.where(frac_bad_per_epoch > global_epoch_thresh)[0]
 
-                        # Convert epoch start (in filtered copy) back to ORIGINAL raw sample indices
+                        # Convert epoch start index (in filtered copy) back to ORIGINAL raw sample indices
                         for epoch_idx in bad_epoch_indices:
                             sample_start = int(events[epoch_idx, 0])  # index in filtered copy
                             if resample_hz and raw.info['sfreq'] != resample_hz:
@@ -1644,6 +1657,14 @@ def find_bad_channels_autoreject_by_type(
                 )
                 detected_bads[f"{typ}_global_bad_epochs"] = global_bad_epochs
                 all_global_bad_epochs.update(global_bad_epochs)
+                global_bad_epoch_counts[typ] = len(global_bad_epochs)
+
+                # --- Final bad set for this type (RANSAC ∪ AutoReject) ---
+                bads_final = list(set(bads_ransac) | set(bad_consensus))
+
+                # --- Summary tallies (autodetect only) ---
+                autodetect_bad_counts[typ] = len(bad_consensus)
+                autodetect_bad_channels_all.update(bad_consensus)
 
             except Exception as e:
                 logger.warning(f"AutoReject failed for {typ.upper()}: {e}")
@@ -1698,6 +1719,30 @@ def find_bad_channels_autoreject_by_type(
         else:
             raw.set_annotations(new_anns)
         logger.info(f"Added {len(new_anns)} BAD_GlobalEpoch annotations to ORIGINAL raw.")
+
+    # ---- End-of-run SUMMARY ----
+    runtime_min = round((time.perf_counter() - t0) / 60.0, 2)
+    total_autodetect_bad = sum(v for v in autodetect_bad_counts.values() if isinstance(v, int))
+    total_global_bad_epochs = len(all_global_bad_epochs)
+
+    # Compact, grep-friendly line:
+    logger.info(
+        "=== AutoReject SUMMARY === "
+        f"runtime={runtime_min:.2f} min; "
+        f"params(cv={ar_cv}, method={ar_method}, n_interp={ar_n_interpolate}); "
+        f"autodetect_bad_channels_total={total_autodetect_bad}; "
+        f"global_bad_epochs_union={total_global_bad_epochs}"
+    )
+    # Optional per-type line for quick comparisons:
+    per_type_bits = []
+    for typ in which_types:
+        if typ in autodetect_bad_counts:
+            per_type_bits.append(
+                f"{typ}: autodetect_bad={autodetect_bad_counts[typ]}, "
+                f"global_epochs={global_bad_epoch_counts.get(typ, 0)}"
+            )
+    if per_type_bits:
+        logger.info("[AutoReject] Per-type: " + " | ".join(per_type_bits))
 
     # Cleanup filtered copy and return
     del raw_filt_all
