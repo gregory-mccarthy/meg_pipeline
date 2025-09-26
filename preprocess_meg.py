@@ -314,7 +314,7 @@ def run_stage1_pipeline(yaml_path: str, p: dict):
         utils.plot_head_movement(head_pos_array, plots_dir)
 
     utils.log_section("4. EEG Channel Setup")
-    eeg_setup_results = utils.prepare_eeg_channels(raw, str(checked_paths["montage"]), logger)
+    eeg_setup_results = utils.prepare_eeg_channels(raw, checked_paths["montage"], logger)
 
     utils.log_section("5. Metadata Repair")
     metadata_repair_results = utils.apply_metadata_repairs(raw, p.get('metadata_fixes', {}))
@@ -1019,9 +1019,13 @@ def run_pipeline(yaml_path: str, force_stage: str = None):
         sys.exit(1)
 
     try:
-        p0 = utils.load_yaml(yaml_path)
+        p0 = utils.build_effective_config(
+            user_yaml_path=yaml_path,
+            lab_defaults_path=os.getenv("LAB_DEFAULTS_YAML"),  # or None if unset
+            fif_path=None  # set to a FIF path if you want auto-detect later
+        )
     except Exception as e:
-        logger.error(f"Failed to load configuration: {e}");
+        logger.error(f"Failed to build effective configuration: {e}")
         sys.exit(1)
 
     for key in ["subject", "bids_root"]:

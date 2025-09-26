@@ -135,17 +135,21 @@ def get_and_check_path(cfg_dict, key, repo_root, description="file"):
         raise FileNotFoundError(f"{description.capitalize()} not found: {resolved}")
     return resolved
 
-def check_critical_files_exist(cfg, repo_root):  # CHANGED: config -> cfg
-    files_to_check = [
-        # Each item: (dict, key, description)
-        (cfg.get("eeg_handling", {}), "montage", "montage file"),     # CHANGED: config -> cfg
-        (cfg, "calibration_file", "MEG calibration file"),           # CHANGED: config -> cfg
-        (cfg, "cross_talk_file", "MEG crosstalk file"),              # CHANGED: config -> cfg
-        # Add more as needed
-    ]
+def check_critical_files_exist(cfg, repo_root):
     checked_paths = {}
-    for cfg_dict, key, desc in files_to_check:
-        checked_paths[key] = get_and_check_path(cfg_dict, key, repo_root, desc)
+
+    # Handle montage specially - allow None
+    eeg_handling = cfg.get("eeg_handling", {})
+    montage = eeg_handling.get("montage") if eeg_handling else None
+    if montage is not None:
+        checked_paths["montage"] = get_and_check_path(eeg_handling, "montage", repo_root, "montage file")
+    else:
+        checked_paths["montage"] = None
+
+    # Handle required files normally
+    checked_paths["calibration_file"] = get_and_check_path(cfg, "calibration_file", repo_root, "MEG calibration file")
+    checked_paths["cross_talk_file"] = get_and_check_path(cfg, "cross_talk_file", repo_root, "MEG crosstalk file")
+
     return checked_paths
 
 def get_bids_headpos_path(subject, session, task, run, meg_dir):
@@ -646,7 +650,7 @@ def prepare_eeg_channels(raw: mne.io.Raw, montage_path: Optional[str], logger: O
         status["montage_assigned"] = True
 
     else:
-        if eeg_picks:
+        if len(eeg_picks) > 0:
             drop_names = [raw.ch_names[i] for i in eeg_picks]
             raw.drop_channels(drop_names)
             if logger:
@@ -1969,3 +1973,117 @@ def apply_final_filter_and_cleanup(raw: mne.io.Raw, cfg: dict) -> mne.io.Raw:
         logger.info(f"Resampled data to {resample_hz} Hz before save")
 
     return raw_proc
+# -------------------------------------------------------------------------
+# New: parameter handling utilities for layered config management
+# -------------------------------------------------------------------------
+import os
+import copy
+from ruamel.yaml import YAML
+
+# Hard-wired base defaults (expand as needed)
+_BASE_DEFAULTS = {
+    "paths": {
+        "bids_root": "./bids",
+        "derivatives_root": "./derivatives",
+        "output_subdir": "preproc",
+    },
+    "pipeline_name": "meg_pipeline",
+    "line_freq": 60,
+    "eeg_handling": "average",
+    "maxwell_filter": {
+        "apply": False,
+        "calibration_file": None,
+        "crosstalk_file": None,
+    },
+    "autoreject": {
+        "apply": False,
+        "n_interpolates": [1, 4, 32],
+        "consensus": [0.5, 0.7, 0.9],
+    },
+}
+
+def _load_yaml(path):
+    yaml = YAML(typ="safe")
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.load(f) or {}
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursive dict merge. Lists are replaced, not concatenated."""
+    for k, v in (override or {}).items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _deep_merge(base[k], v)
+        else:
+            base[k] = copy.deepcopy(v)
+    return base
+
+def build_effective_config(user_yaml_path, lab_defaults_path=None, fif_path=None):
+    """
+    Merge base defaults, optional lab defaults, and user YAML.
+    Precedence for selecting the lab defaults path:
+      1) explicit function arg (lab_defaults_path)
+      2) environment variable LAB_DEFAULTS_YAML
+      3) 'lab_defaults' field inside the user YAML
+
+    Merge precedence for config keys: user > lab > base.
+    """
+    cfg = copy.deepcopy(_BASE_DEFAULTS)
+
+    # --- Step 1: (light) read of user YAML to discover optional lab_defaults ---
+    user_cfg_light = {}
+    if user_yaml_path and os.path.exists(user_yaml_path):
+        try:
+            user_cfg_light = _load_yaml(user_yaml_path) or {}
+            if not isinstance(user_cfg_light, dict):
+                raise ValueError(f"Top-level of user YAML must be a mapping: {user_yaml_path}")
+        except Exception as e:
+            raise RuntimeError(f"Failed to read user YAML '{user_yaml_path}': {e}") from e
+
+    # Resolve lab defaults path with clear precedence:
+    # explicit arg > env var > user YAML field
+    lab_path_resolved = (
+        lab_defaults_path
+        if lab_defaults_path
+        else os.getenv("LAB_DEFAULTS_YAML")
+        or user_cfg_light.get("lab_defaults")
+    )
+
+    # --- Step 2: merge lab defaults (if any) into base ---
+    if lab_path_resolved:
+        if not os.path.exists(lab_path_resolved):
+            raise FileNotFoundError(f"Lab defaults YAML not found: {lab_path_resolved}")
+        lab_cfg = _load_yaml(lab_path_resolved) or {}
+        if not isinstance(lab_cfg, dict):
+            raise ValueError(f"Top-level of lab defaults YAML must be a mapping: {lab_path_resolved}")
+        _deep_merge(cfg, lab_cfg)
+
+    # --- Step 3: merge full user config (after removing 'lab_defaults' key, if present) ---
+    if user_cfg_light:
+        user_cfg_full = dict(user_cfg_light)  # shallow copy
+        user_cfg_full.pop("lab_defaults", None)  # don't leak this into effective config
+        _deep_merge(cfg, user_cfg_full)
+
+    # --- Step 4: optional FIF auto-detection (future hook) ---
+    if fif_path:
+        # TODO: use mne to detect has_eeg/meg/eog/ecg and set modality flags accordingly
+        pass
+
+    return cfg
+
+def get_param(cfg, key, default=None, required=False, dtype=None, choices=None):
+    """
+    Safe getter for config values with validation.
+    """
+    if key not in cfg:
+        if required:
+            raise ValueError(f"Missing required parameter: {key}")
+        return default
+
+    val = cfg[key]
+
+    if dtype and not isinstance(val, dtype):
+        raise TypeError(f"Parameter '{key}' must be {dtype}, got {type(val)}")
+
+    if choices and val not in choices:
+        raise ValueError(f"Parameter '{key}' must be one of {choices}, got {val}")
+
+    return val
