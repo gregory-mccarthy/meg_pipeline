@@ -6,6 +6,9 @@ import matplotlib.pyplot as plt
 import mne
 from mne.preprocessing import ICA
 from mne_bids import BIDSPath
+from mne.io.constants import FIFF
+from mne.bem import fit_sphere_to_headshape
+
 from scipy.signal import find_peaks
 import numpy as np
 from autoreject import Ransac, AutoReject
@@ -1908,9 +1911,68 @@ def run_ica(raw: mne.io.Raw, config: dict, output_path: Path, modality: str) -> 
     logger.info(f"Excluded {modality.upper()} ICA components: {exclude}")
     return raw_clean, exclude
 
-def apply_maxwell_filter(raw: mne.io.Raw, head_pos=None, destination=None, cal=None, crosstalk=None) -> mne.io.Raw:
+def _fit_origin_from_headshape(info: mne.Info) -> np.ndarray:
+    """
+    Fit head-sphere center from HEAD-frame head-shape points (EXTRA + CARDINAL).
+    Robust to MNE return-shape changes. Returns (x, y, z) in meters (HEAD).
+    """
+    dig = info.get("dig", None) or []
+    usable = [
+        d for d in dig
+        if d.get("coord_frame") == FIFF.FIFFV_COORD_HEAD
+        and d.get("kind") in (FIFF.FIFFV_POINT_EXTRA, FIFF.FIFFV_POINT_CARDINAL)
+    ]
+    if len(usable) < 3:
+        raise RuntimeError("Not enough HEAD-frame head-shape points to fit SSS origin.")
+
+    res = fit_sphere_to_headshape(info=info)
+    # MNE versions have returned (origin, radius), (radius, origin), or (origin, radius, <extra>)
+    origin = None
+    # Flatten tuple to inspect each element
+    if isinstance(res, tuple):
+        for item in res:
+            arr = np.asarray(item)
+            if arr.shape == (3,):        # likely the origin
+                origin = arr.astype(float)
+    # Final check
+    if origin is None:
+        raise RuntimeError(f"Unexpected return from fit_sphere_to_headshape: {type(res)} / {res}")
+    return origin
+
+def apply_maxwell_filter(
+    raw: mne.io.Raw,
+    head_pos=None,
+    destination=None,
+    cal=None,
+    crosstalk=None,
+    *,
+    fallback_origin: tuple[float, float, float] = (0.0, 0.0, 0.04),
+) -> mne.io.Raw:
+    """
+    Robust tSSS wrapper that ignores EEG electrode geometry:
+      • Origin fitted from head-shape (EXTRA + CARDINAL) in HEAD frame
+      • No 'picks' kwarg (older MNE); assume upstream dropped EEG if needed
+      • Fallback origin if fit fails
+    """
     logger.info("Applying Maxwell filter (tSSS)...")
-    return mne.preprocessing.maxwell_filter(raw, head_pos=head_pos, destination=destination, calibration=cal, cross_talk=crosstalk, st_duration=10.0, coord_frame='head', verbose='error')
+    try:
+        origin = _fit_origin_from_headshape(raw.info)
+        logger.info(f"[SSS] Using fitted HEAD origin: {origin.round(4).tolist()} m")
+    except Exception as e:
+        origin = np.asarray(fallback_origin, float)
+        logger.warning(f"[SSS] Head-shape origin fit failed ({e}); using fallback {origin.tolist()} m")
+
+    return mne.preprocessing.maxwell_filter(
+        raw,
+        origin=origin,
+        head_pos=head_pos,
+        destination=destination,
+        calibration=cal,
+        cross_talk=crosstalk,
+        st_duration=10.0,
+        coord_frame="head",
+        verbose="error",
+    )
 
 def bitwise_events(raw: mne.io.Raw, mask: int = 0xFFFF, min_high: int = 2, min_off: int = 5) -> np.ndarray:
     ST_CH = 'STI101'
