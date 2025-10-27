@@ -29,13 +29,13 @@ except ImportError:
     _yaml_mode = 'pyyaml'
 
 # (If needed by main)
-from bids_io_utils import (
+from bids_io_utils_v2 import (
     fetch_bids_data_and_sidecars,
     push_bids_derivatives_rsync,
     detect_environment,
     write_bids_robust,
     read_raw_bids_robust,
-    get_all_bids_split_files
+    get_all_bids_split_files,
 )
 
 def load_yaml(path: str) -> dict:
@@ -1974,25 +1974,128 @@ def apply_maxwell_filter(
         verbose="error",
     )
 
-def bitwise_events(raw: mne.io.Raw, mask: int = 0xFFFF, min_high: int = 2, min_off: int = 5) -> np.ndarray:
-    ST_CH = 'STI101'
-    pick = mne.pick_channels(raw.ch_names, [ST_CH])
-    if not pick: return np.empty((0, 3), int)
-    stim = raw.get_data(picks=pick)[0].astype(np.uint16) & mask
+# === Composite trigger extraction (early-onset timing, final-code labeling) ===
+import numpy as np
+import mne
+
+def events_from_sti101_early_onset_final_code(
+    raw: mne.io.BaseRaw,
+    *,
+    stim_channel: str = "STI101",
+    mask: int = 0xFFFF,
+    max_settle_ms: float = 6.0,
+    refractory_ms: float = 20.0
+) -> np.ndarray:
+    """
+    Return MNE-style events array (n,3): [sample_index, 0, code].
+
+    • Onset timing = FIRST sample where STI101 goes 0 -> nonzero (no latency penalty).
+    • Code labeling = MAX nonzero value observed within max_settle_ms after onset
+      (captures the final composite code when lines rise within a few samples).
+    • Global refractory prevents bounce/near-duplicates across bits.
+
+    Parameters
+    ----------
+    raw : mne.io.BaseRaw
+        Raw object with STI101 present.
+    stim_channel : str
+        Name of composite stim channel (default 'STI101').
+    mask : int
+        Bitmask of valid lines (e.g., 0x00FF for low 8 bits).
+    max_settle_ms : float
+        Look-ahead window (ms) to capture late-arriving bits for code labeling.
+    refractory_ms : float
+        Minimum gap (ms) between accepted onsets.
+
+    Returns
+    -------
+    events : np.ndarray, shape (n_events, 3)
+        MNE events array: [sample_index, 0, code]
+    """
+    sf = float(raw.info["sfreq"])
+    settle = int(round(max_settle_ms * 1e-3 * sf))
+    refr   = int(round(refractory_ms * 1e-3 * sf))
+
+    picks = mne.pick_channels(raw.ch_names, [stim_channel])
+    if len(picks) == 0:
+        return np.empty((0, 3), dtype=int)
+
+    stim = raw.get_data(picks=picks, start=0, stop=None)[0].astype(np.uint16)
+    stim &= np.uint16(mask)
+
+    # Rising edges on the composite word: 0 -> >0
+    prev = np.empty_like(stim)
+    prev[0] = 0
+    prev[1:] = stim[:-1]
+    rising_idx = np.flatnonzero((prev == 0) & (stim > 0))
+
     events = []
-    for bit in range(16):
-        code = 1 << bit
-        if mask & code == 0: continue
-        vec = (stim & code) != 0
-        onsets = np.flatnonzero(vec)
-        if not len(onsets): continue
-        runs = np.split(onsets, np.where(np.diff(onsets) > 1)[0] + 1)
-        last_rise = -min_off - 1
-        for r in runs:
-            if len(r) >= min_high and r[0] - last_rise >= min_off:
-                events.append([r[0], 0, code])
-                last_rise = r[0]
-    return np.array(sorted(events), dtype=int)
+    last_onset = -refr - 1
+    N = stim.size
+
+    for idx in rising_idx:
+        if idx - last_onset < refr:
+            continue
+
+        # Look ahead briefly to capture the final composite code (no timestamp shift)
+        end = min(idx + settle, N)
+        window = stim[idx:end]
+        nz = window[window > 0]
+        if nz.size == 0:
+            continue
+        code = int(nz.max())
+
+        events.append([int(idx), 0, code])
+        last_onset = int(idx)
+
+    events = np.asarray(events, dtype=int)
+    if events.size:
+        events = events[np.argsort(events[:, 0])]
+    return events
+
+
+def annotate_events_from_sti101(
+    raw: mne.io.BaseRaw,
+    *,
+    stim_channel: str = "STI101",
+    mask: int = 0xFFFF,
+    max_settle_ms: float = 6.0,
+    refractory_ms: float = 20.0,
+    prefix: str = "TRIG/",
+    replace: bool = False
+) -> np.ndarray:
+    """
+    Convenience wrapper:
+      1) Extract composite events via events_from_sti101_early_onset_final_code
+      2) Store them as MNE Annotations with labels like 'TRIG/<code>'
+
+    Returns the events array for immediate downstream use.
+
+    Set replace=True to drop existing annotations before adding new ones.
+    """
+    events = events_from_sti101_early_onset_final_code(
+        raw,
+        stim_channel=stim_channel,
+        mask=mask,
+        max_settle_ms=max_settle_ms,
+        refractory_ms=refractory_ms,
+    )
+    if events.size == 0:
+        if replace:
+            raw.set_annotations(mne.Annotations([], [], []))
+        return events
+
+    onsets_sec = events[:, 0] / raw.info["sfreq"]
+    descs = [f"{prefix}{int(c)}" for c in events[:, 2]]
+    durs = np.zeros(len(onsets_sec), dtype=float)
+
+    new_anns = mne.Annotations(onsets_sec, durs, descs)
+    if replace:
+        raw.set_annotations(new_anns)
+    else:
+        raw.set_annotations(raw.annotations + new_anns)
+
+    return events
 
 def apply_final_filter_and_cleanup(raw: mne.io.Raw, cfg: dict) -> mne.io.Raw:
     """

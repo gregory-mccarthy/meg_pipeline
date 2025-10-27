@@ -66,12 +66,12 @@ else:
     matplotlib.use("QtAgg", force=True)
 
 try:
-    import meg_pipeline_utils_v4 as utils
+    import meg_pipeline_utils_v5 as utils
 except ImportError:
     import meg_pipeline_utils as utils
 
 try:
-    from transfer_manager import HybridTransferManager
+    from transfer_manager_v2 import HybridTransferManager
 except ImportError:
     HybridTransferManager = None
 
@@ -680,22 +680,39 @@ def run_stage2_pipeline(yaml_path: str, p: dict, checkpoint_path: Path):
 
     utils.plot_psd_and_peaks(raw, "After ICA", plots_dir)
 
+    # --- 7. Event Detection (revised: composite events from STI101, early-onset/final-code) ---
     utils.log_section("7. Event Detection")
     event_detection_results = {}
+
     try:
-        events = utils.bitwise_events(raw)
+        # Tunables (safe defaults; tighten MASK to your used lines, e.g., 0x00FF)
+        STIM_CH = "STI101"
+        MASK = 0xFFFF
+        MAX_SETTLE_MS = 6.0  # look-ahead to label the final composite code (no timestamp shift)
+        REFRACTORY_MS = 20.0  # suppress re-triggers/bounce within this window
+
+        # Extract composite events (timestamps at first 0->nonzero sample)
+        events = utils.events_from_sti101_early_onset_final_code(
+            raw,
+            stim_channel=STIM_CH,
+            mask=MASK,
+            max_settle_ms=MAX_SETTLE_MS,
+            refractory_ms=REFRACTORY_MS,
+        )
+
         if events.size:
-            annots = utils.mne.annotations_from_events(events, sfreq=raw.info['sfreq'])
-            if raw.annotations is not None and len(raw.annotations) > 0:
-                combined = mne.Annotations(
-                    onset=list(raw.annotations.onset) + list(annots.onset),
-                    duration=list(raw.annotations.duration) + list(annots.duration),
-                    description=list(raw.annotations.description) + list(annots.description),
-                    orig_time=raw.annotations.orig_time
-                )
-                raw.set_annotations(combined)
-            else:
-                raw.set_annotations(annots)
+            # Replace any prior annotations with clean TRIG/<code> annotations
+            utils.annotate_events_from_sti101(
+                raw,
+                stim_channel=STIM_CH,
+                mask=MASK,
+                max_settle_ms=MAX_SETTLE_MS,
+                refractory_ms=REFRACTORY_MS,
+                prefix="TRIG/",
+                replace=True,  # drop legacy per-bit annotations if present
+            )
+
+            # Summarize counts
             codes, counts = np.unique(events[:, 2], return_counts=True)
             event_counts = {int(c): int(n) for c, n in zip(codes, counts)}
 
@@ -703,17 +720,30 @@ def run_stage2_pipeline(yaml_path: str, p: dict, checkpoint_path: Path):
                 "success": True,
                 "n_events_total": int(events.shape[0]),
                 "event_counts": event_counts,
-                "unique_event_codes": [int(c) for c in codes]
+                "unique_event_codes": [int(c) for c in codes],
+                "stim_channel": STIM_CH,
+                "mask_hex": hex(MASK),
+                "max_settle_ms": float(MAX_SETTLE_MS),
+                "refractory_ms": float(REFRACTORY_MS),
             }
-            logger.info(f"Detected {events.shape[0]} events with codes: {list(codes)}")
+            logger.info(
+                f"[Events] total={events.shape[0]} "
+                f"codes={list(map(int, codes))} "
+                f"mask={hex(MASK)} settle={MAX_SETTLE_MS}ms refr={REFRACTORY_MS}ms"
+            )
         else:
-            logger.warning("No events detected")
+            logger.warning("No events detected on STI101 with current mask/parameters.")
             event_detection_results = {
                 "success": True,
                 "n_events_total": 0,
                 "event_counts": {},
-                "unique_event_codes": []
+                "unique_event_codes": [],
+                "stim_channel": STIM_CH,
+                "mask_hex": hex(MASK),
+                "max_settle_ms": float(MAX_SETTLE_MS),
+                "refractory_ms": float(REFRACTORY_MS),
             }
+
     except Exception as e:
         logger.error(f"Event detection failed: {e}")
         event_detection_results = {"success": False, "error": str(e)}

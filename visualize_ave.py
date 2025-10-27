@@ -2,11 +2,24 @@
 import sys
 from pathlib import Path
 import subprocess
-import yaml
+# Try to import ruamel.yaml first, fallback to PyYAML
+try:
+    from ruamel.yaml import YAML
+    yaml_handler = YAML(typ='safe', pure=True)
+    def yaml_safe_load(stream):
+        return yaml_handler.load(stream)
+except ImportError:
+    import yaml
+    def yaml_safe_load(stream):
+        return yaml.safe_load(stream)
+
 import numpy as np
 import matplotlib
-matplotlib.use('Qt5Agg')
+
+import matplotlib
 import matplotlib.pyplot as plt
+print("[viz] Matplotlib backend:", matplotlib.get_backend())  # should print 'MacOSX' on your machine
+
 import mne
 
 DEFAULT_YLIMS = {
@@ -77,7 +90,7 @@ def focus_terminal():
 
 def load_config(yaml_path):
     with open(yaml_path, 'r') as f:
-        config = yaml.safe_load(f)
+        config = yaml_safe_load(f)
     return config
 
 def build_evoked_fname(config):
@@ -203,364 +216,210 @@ def prompt_for_axis_limits(default_xlim, default_ylim, units):
         except Exception as e:
             print(f"Invalid input: {e}. Please use start,end for X (s, ms precision) and Y ({units})")
 
-def plot_waveforms(evokeds, ch_type, ch_idx, cond_indices, xlim, ylim, colors, sensor_names, times):
-    """Plot waveforms from multiple evokeds for the same channel."""
-    plt.figure(figsize=(7, 5))
-    for cond_i, color in zip(cond_indices, colors):
-        ev = evokeds[cond_i]
-        picks = get_channel_indices(ev, ch_type)
-        if not picks:
-            continue
-        idx, ch_name = picks[ch_idx]
-        plt.plot(times, ev.data[idx, :], color=color, lw=2, label=f"{ev.comment}")
-    plt.xlabel('Time (s)')
-    plt.ylabel(f'Amplitude [{ch_type}]')
-    plt.title(f"{sensor_names[ch_idx]} ({ch_type})")
-    plt.legend()
-    plt.xlim(xlim)
-    plt.ylim(ylim)
-    plt.grid(True)
-    plt.show(block=False)
-    focus_terminal()  # <-- Added
-
-def get_channel_types(evokeds):
-    ch_types = set()
-    for ev in evokeds:
-        ch_types.update(ev.get_channel_types())
-    return [t for t in ('mag', 'grad', 'eeg') if t in ch_types]
-
-def get_data_minmax(evokeds, ch_type, scale):
-    vals = []
-    for ev in evokeds:
-        picks = get_channel_indices(ev, ch_type)
-        idxs = [i for i, _ in picks]
-        if not idxs:
-            continue
-        vals.append(np.concatenate([ev.data[i, :] for i in idxs]))
-    if not vals:
-        return None, None
-    all_vals = np.concatenate(vals)
-    return np.nanmin(all_vals) * scale, np.nanmax(all_vals) * scale
-
-def get_sensor_names(ev, ch_type):
-    picks = get_channel_indices(ev, ch_type)
-    return [name for idx, name in picks]
-
-def prompt_for_channel_type(ch_types):
-    while True:
-        ch_type = input(f"Select channel type {ch_types}: ").strip().lower()
-        if ch_type in ch_types:
-            return ch_type
-        print(f"Please type one of {ch_types}.")
-
-def prompt_for_conditions(evokeds):
-    while True:
-        cond_str = input("Enter condition numbers to plot (comma-separated, e.g., 1,2): ").strip()
-        try:
-            cond_indices = [int(c)-1 for c in cond_str.split(',') if c]
-            if all(0 <= i < len(evokeds) for i in cond_indices):
-                return cond_indices
-        except Exception:
-            pass
-        print("Invalid selection. Please enter valid condition numbers.")
-
-def plot_single_sensor_multi_condition(evokeds, ch_type, idx, cond_indices, xlim, ylim, colors, sensor_names, times, scale, units):
-    plt.figure(figsize=(7, 5))
-    for cond_i, color in zip(cond_indices, colors):
-        ev = evokeds[cond_i]
-        picks = get_channel_indices(ev, ch_type)
-        if not picks:
-            continue
-        ch_i, ch_name = picks[idx]
-        plt.plot(ev.times, ev.data[ch_i, :] * scale, color=color, lw=2, label=f"{ev.comment}")
-    plt.xlabel('Time (s)')
-    plt.ylabel(f'Amplitude [{units}]')
-    plt.title(f"{sensor_names[idx]} ({ch_type})")
-    plt.legend()
-    plt.xlim(xlim)
-    plt.ylim(ylim)
-    plt.grid(True)
-    plt.show(block=False)
-    focus_terminal()  # <-- Added
-
-def navigate_sensors(sensor_names, idx, user_input):
-    """
-    Accepts l/r/u/d, number (1-based), full name, or last 3 digits.
-    """
-    sensor_lookup = {name.lower(): i for i, name in enumerate(sensor_names)}
-    suffix_lookup = {name[-3:]: i for i, name in enumerate(sensor_names) if name.startswith('MEG')}
-    nav = user_input.strip().lower()
-    if nav in ('exit', 'quit'):
-        return None
-    elif nav in ('right', 'r', ''):
-        return (idx + 1) % len(sensor_names)
-    elif nav in ('left', 'l'):
-        return (idx - 1) % len(sensor_names)
-    elif nav in ('up', 'u'):
-        return (idx - 1) % len(sensor_names)
-    elif nav in ('down', 'd'):
-        return (idx + 1) % len(sensor_names)
-    elif nav.isdigit():
-        n = int(nav)
-        if 1 <= n <= len(sensor_names):
-            return n - 1  # 1-based index
-        # Also try as last 3 digits
-        if nav in suffix_lookup:
-            return suffix_lookup[nav]
-    elif nav in sensor_lookup:
-        return sensor_lookup[nav]
-    else:
-        # Try last 3 digits with leading zeros
-        nav3 = nav.zfill(3)
-        if nav3 in suffix_lookup:
-            return suffix_lookup[nav3]
-        # Try partial matches (optional)
-        for i, name in enumerate(sensor_names):
-            if nav in name.lower():
-                return i
-        print("Use l/r/u/d, a number, a sensor name, last three digits, or 'exit' to quit.")
-        return idx
-
-def plot_magnetometer_matrix(info, n_rows=8, n_cols=16, label_style='short'):
-    """
-    Display magnetometer sensors in a clean 2D matrix:
-    - Columns = Anterior–Posterior (A–P)
-    - Rows   = Left–Right (L–R)
-    - label_style: 'short' = last 3 digits, 'index' = 1-based, 'full' = full name
-    """
-    import numpy as np
-    import matplotlib.pyplot as plt
-
-    # Pick magnetometers
-    picks = mne.pick_types(info, meg='mag')
-    coords = np.array([info['chs'][i]['loc'][:2] for i in picks])
-    sensor_names = [info['ch_names'][i] for i in picks]
-
-    def short_label(name):
-        return name[-3:] if len(name) >= 3 else name
-
-    def label_for(i, name):
-        if label_style == 'short':
-            return short_label(name)
-        elif label_style == 'index':
-            return str(i+1)
-        else:
-            return name
-
-    x = coords[:, 0]
-    y = coords[:, 1]
-    x_bins = np.linspace(x.min(), x.max(), n_cols+1)
-    y_bins = np.linspace(y.min(), y.max(), n_rows+1)
-    grid = np.full((n_rows, n_cols), '', dtype=object)
-
-    for i, (xi, yi) in enumerate(zip(x, y)):
-        col = np.digitize(xi, x_bins) - 1  # L–R
-        row = np.digitize(yi, y_bins) - 1  # A–P
-        row = np.clip(row, 0, n_rows-1)
-        col = np.clip(col, 0, n_cols-1)
-        lbl = label_for(i, sensor_names[i])
-        if grid[row, col] == '':
-            grid[row, col] = lbl
-        else:
-            grid[row, col] += f",{lbl}"
-
-    fig, ax = plt.subplots(figsize=(n_cols, n_rows))
-    ax.set_xlim(-0.5, n_cols-0.5)
-    ax.set_ylim(-0.5, n_rows-0.5)
-    ax.set_xticks([])
-    ax.set_yticks([])
-    # No axis labels for a clean grid
-
-    for row in range(n_rows):
-        for col in range(n_cols):
-            txt = grid[row, col]
-            if txt != '':
-                ax.text(col, row, txt, ha='center', va='center', fontsize=10, color='red')
-
-    ax.set_title("Magnetometer Matrix (A–P columns × L–R rows)")
-    ax.invert_yaxis()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.show(block=False)
-
 def waveform_browser(evokeds):
-    import matplotlib.pyplot as plt
+    """Interactive single-sensor waveform browser with condition overlay."""
+    print("\n=== Waveform Browser (single sensor, overlay conditions) ===")
 
-    sensor_names = evokeds[0].info['ch_names']
-    n_sensors = len(sensor_names)
-    info = evokeds[0].info
-    print(f"{n_sensors} channels available. (mag, grad, eeg, etc)")
-
+    # Display available conditions
     print("Available conditions:")
     for i, ev in enumerate(evokeds, 1):
         print(f"  ({i}) {ev.comment}")
 
-    # Prompt for initial channel to browse
-    indices = prompt_for_channels(sensor_names)
-    if not indices:
-        print("Exiting waveform browser.")
+    # Prompt for conditions
+    cond_indices = prompt_for_conditions(evokeds)
+    if cond_indices is None:
         return
-    idx = indices[0]
 
-    # Prompt for initial conditions ONCE
-    cond_indices = None
-    while cond_indices is None:
-        cond_in = input("Enter condition numbers to overlay (comma-separated, e.g., 1,2): ").strip()
-        try:
-            cond_indices = [int(c)-1 for c in cond_in.split(',') if c]
-            if not all(0 <= i < len(evokeds) for i in cond_indices):
-                print("Invalid selection."); cond_indices = None
-        except Exception:
-            print("Invalid input."); cond_indices = None
+    # Channel types to consider
+    available_ch_types = available_types(evokeds[0])
+    if not available_ch_types:
+        print("No plottable channel types found.")
+        return
 
-    # Y-limits (per type) setup
+    sensor_names = evokeds[0].ch_names
+
+    # Starting sensor index
+    sensor_idx = 0
+
+    # Colors for conditions
+    colors = ['blue', 'red', 'green', 'purple', 'orange', 'brown', 'pink', 'gray']
+    
+    # Y-limits (per type) setup - using DEFAULT_YLIMS
     current_ylims = DEFAULT_YLIMS.copy()
 
-    def get_type_indices(current_type):
-        """Get all indices of channels of the same type as current_type."""
-        return [i for i, name in enumerate(sensor_names) if get_channel_type(info, i) == current_type]
-
-    current_type = get_channel_type(info, idx)
-    type_indices = get_type_indices(current_type)
-    type_pos = type_indices.index(idx)
-
     while True:
-        # Plot
-        ch_type = get_channel_type(info, idx)
-        plt.figure(figsize=(9, 5))
-        colors = plt.get_cmap('tab10').colors
-        for color, cond_idx in zip(colors, cond_indices):
-            ev = evokeds[cond_idx]
-            plt.plot(
-                ev.times, ev.data[idx, :] * SCALE[ch_type],
-                color=color, lw=2, label=f"{sensor_names[idx]} ({ch_type}) - {ev.comment}"
-            )
-        plt.xlabel('Time (s)')
-        plt.ylabel(f"Amplitude [{UNITS[ch_type]}]")
-        plt.legend()
-        y_min, y_max = current_ylims[ch_type]
-        plt.ylim((y_min, y_max))
-        plt.grid(True)
+        # Plot the selected sensor for all conditions
+        sensor_name = sensor_names[sensor_idx]
+        ch_type = get_channel_type(evokeds[0].info, sensor_idx)
+        
+        # Skip if not a plottable channel type
+        if ch_type not in ('mag', 'grad', 'eeg'):
+            sensor_idx = (sensor_idx + 1) % len(sensor_names)
+            continue
+            
+        units = UNITS.get(ch_type, 'AU')
+        scale = SCALE.get(ch_type, 1.0)
+
+        print(f"\nSensor: {sensor_name} ({ch_type})")
+
+        # Get X-axis limits (full epoch by default)
+        xlim = [evokeds[0].times[0], evokeds[0].times[-1]]
+        
+        # Use the DEFAULT_YLIMS or current_ylims for this channel type
+        ylim = current_ylims[ch_type]
+
+        # Plot the waveforms
+        fig, ax = plt.subplots(figsize=(10, 6))
+        for i, cond_i in enumerate(cond_indices):
+            ev = evokeds[cond_i]
+            times = ev.times
+            signal = ev.data[sensor_idx, :] * scale
+            label = ev.comment
+            color = colors[i % len(colors)]
+            ax.plot(times, signal, label=label, color=color, linewidth=1.5)
+
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+        ax.set_xlabel('Time (s)', fontsize=12)
+        ax.set_ylabel(f'Amplitude ({units})', fontsize=12)
+        ax.set_title(f'Sensor: {sensor_name} ({ch_type})', fontsize=14)
+        ax.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+        ax.axvline(x=0, color='black', linestyle='--', linewidth=0.5)
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc='upper right')
+        plt.tight_layout()
         plt.show(block=False)
 
-        print(f"\nCurrently plotting channel {idx+1}/{len(sensor_names)}: {sensor_names[idx]} ({ch_type})")
-        print("Type l/r/u/d (prev/next within this type), a number, full channel name, last three digits,")
-        print("'scale' to adjust y-limits, 'cond' to change overlayed conditions,")
-        print("'close' to close plots, or 'quit': ")
-        nav = input().strip().lower()
+        # Bring terminal to foreground
+        focus_terminal()
 
-        if nav in ('quit', 'exit'):
+        # Navigation prompt
+        print("\nOptions:")
+        print("  Press 'Enter' for next sensor")
+        print(f"  Type a number 1-{len(sensor_names)} for specific sensor index")
+        print("  Type 'p' for previous sensor")
+        print("  Type sensor name (e.g., 'MEG0111', 'STI101') to jump to it")
+        print("  Type 'scale' to adjust y-limits")
+        print("  Type 'axis' to set custom axis limits")
+        print("  Type 'cond' to select different conditions")
+        print("  Type 'close' to close plots")
+        print("  Type 'quit' to exit browser")
+        nav = input("Your choice: ").strip().lower()
+
+        if nav == 'quit':
             break
+        elif nav == '' or nav == 'n':
+            sensor_idx = (sensor_idx + 1) % len(sensor_names)
+        elif nav == 'p':
+            sensor_idx = (sensor_idx - 1) % len(sensor_names)
+        elif nav.isdigit():
+            idx = int(nav) - 1
+            if 0 <= idx < len(sensor_names):
+                sensor_idx = idx
+                # Check if this is a plottable channel
+                new_ch_type = get_channel_type(evokeds[0].info, sensor_idx)
+                if new_ch_type not in ('mag', 'grad', 'eeg'):
+                    print(f"Warning: {sensor_names[sensor_idx]} is type '{new_ch_type}' which cannot be plotted.")
+                    print("Only mag, grad, and eeg channels can be displayed.")
+            else:
+                print(f"Invalid index. Must be 1-{len(sensor_names)}.")
+        elif nav == 'scale':
+            # Adjust Y-limits for the current channel type
+            current_ylims = prompt_for_ylims([ch_type], current_ylims)
+        elif nav == 'axis':
+            xlim, ylim = prompt_for_axis_limits(xlim, ylim, units)
+            # Update the current_ylims to remember this change
+            current_ylims[ch_type] = ylim
+        elif nav == 'cond':
+            new_conds = prompt_for_conditions(evokeds)
+            if new_conds:
+                cond_indices = new_conds
         elif nav in ('close', 'closeall', 'c'):
             plt.close('all')
             print("All plot windows closed.")
-            continue
-        elif nav == 'scale':
-            current_ylims = prompt_for_ylims([ch_type], current_ylims)
-            continue
-        elif nav == 'cond':
-            # Prompt for new conditions
-            while True:
-                cond_in = input("Enter new condition numbers to overlay (comma-separated, e.g., 1,2): ").strip()
-                try:
-                    new_cond_indices = [int(c)-1 for c in cond_in.split(',') if c]
-                    if all(0 <= i < len(evokeds) for i in new_cond_indices):
-                        cond_indices = new_cond_indices
-                        break
-                except Exception:
-                    pass
-                print("Invalid input. Please enter valid condition numbers.")
-            continue
         else:
-            # Navigation within type
-            next_idx = None
-            # Navigation logic
-            if nav in ('right', 'r', ''):
-                type_pos = (type_pos + 1) % len(type_indices)
-                next_idx = type_indices[type_pos]
-            elif nav in ('left', 'l'):
-                type_pos = (type_pos - 1) % len(type_indices)
-                next_idx = type_indices[type_pos]
-            elif nav.isdigit():
-                # Check if this digit matches a position in type_indices
-                n = int(nav)
-                if 1 <= n <= len(type_indices):
-                    type_pos = n - 1
-                    next_idx = type_indices[type_pos]
-                else:
-                    # Also try as last 3 digits
-                    nav3 = nav.zfill(3)
-                    for i, idx_i in enumerate(type_indices):
-                        if sensor_names[idx_i][-3:] == nav3:
-                            type_pos = i
-                            next_idx = type_indices[type_pos]
-                            break
-            elif nav in sensor_names:
-                target_idx = sensor_names.index(nav)
-                if get_channel_type(info, target_idx) == current_type:
-                    type_pos = type_indices.index(target_idx)
-                    next_idx = target_idx
-                else:
-                    # Switch type: start new navigation list
-                    idx = target_idx
-                    current_type = get_channel_type(info, idx)
-                    type_indices = get_type_indices(current_type)
-                    type_pos = type_indices.index(idx)
-                    continue
-            elif len(nav) == 3 and any(sensor_names[i][-3:] == nav for i in type_indices):
-                for i, idx_i in enumerate(type_indices):
-                    if sensor_names[idx_i][-3:] == nav:
-                        type_pos = i
-                        next_idx = type_indices[type_pos]
-                        break
-            if next_idx is not None:
-                idx = next_idx
-            else:
-                print(f"Use l/r/u/d, a number (within this type), sensor name, or last 3 digits within {ch_type.upper()} channels.")
+            # Try to find sensor by name
+            found = False
+            for i, name in enumerate(sensor_names):
+                if nav.upper() == name.upper():
+                    sensor_idx = i
+                    found = True
+                    # Check if this is a plottable channel
+                    new_ch_type = get_channel_type(evokeds[0].info, sensor_idx)
+                    if new_ch_type not in ('mag', 'grad', 'eeg'):
+                        print(f"Warning: {sensor_names[sensor_idx]} is type '{new_ch_type}' which cannot be plotted.")
+                        print("Only mag, grad, and eeg channels can be displayed.")
+                    break
+            if not found:
+                print(f"Unknown command or sensor: '{nav}'")
 
-    print("Waveform browsing complete.")
+    print("Waveform browser complete.\n")
+
 
 def multi_sensor_overlay(evokeds):
-    sensor_names = evokeds[0].info['ch_names']
-    n_sensors = len(sensor_names)
-    info = evokeds[0].info
-    print(f"{n_sensors} channels available. (mag, grad, eeg, etc)")
+    """Interactive multi-sensor overlay on a single axis."""
+    print("\n=== Multi-Sensor Overlay (multiple sensors, single condition) ===")
+
+    # Display available conditions
     print("Available conditions:")
     for i, ev in enumerate(evokeds, 1):
         print(f"  ({i}) {ev.comment}")
 
-    # Prompt ONCE for condition
-    cond_idx = None
-    while cond_idx is None:
-        cond_in = input("Select a condition number for overlay: ").strip()
+    # Select condition
+    while True:
+        cond_in = input("Select a condition number or 'quit': ").strip()
+        if cond_in.lower() == 'quit':
+            return
         try:
             idx = int(cond_in) - 1
             if 0 <= idx < len(evokeds):
                 cond_idx = idx
+                break
         except Exception:
             pass
-        if cond_idx is None:
-            print("Please enter a valid condition number.")
+        print("Please enter a valid condition number.")
 
-    # Prompt ONCE for sensors to overlay
+    ev = evokeds[cond_idx]
+    sensor_names = ev.ch_names
+    print(f"\nCondition: {ev.comment}")
+    print(f"Total sensors: {len(sensor_names)}")
+
+    # Prompt for initial set of sensors to overlay
     indices = prompt_for_channels(sensor_names)
     if not indices:
-        print("Exiting overlay.")
         return
 
-    # Default y-limits per type
+    # Initial Y-limits by channel type
     current_ylims = DEFAULT_YLIMS.copy()
 
     while True:
-        ch_types = set(get_channel_type(info, i) for i in indices)
-        plt.figure(figsize=(9, 5))
-        colors = plt.get_cmap('tab10').colors
-        for idx, color in zip(indices, colors):
-            ch_type = get_channel_type(info, idx)
-            plt.plot(
-                evokeds[cond_idx].times, evokeds[cond_idx].data[idx, :] * SCALE[ch_type],
-                color=color, lw=2, label=f"{sensor_names[idx]} ({ch_type})"
-            )
+        # Determine channel types for selected sensors
+        ch_types = set()
+        for idx in indices:
+            ch_types.add(get_channel_type(ev.info, idx))
+
+        # Filter to only plottable types
+        ch_types = [t for t in ch_types if t in ('mag', 'grad', 'eeg')]
+        if not ch_types:
+            print("No plottable channel types selected.")
+            indices = prompt_for_channels(sensor_names)
+            if not indices:
+                break
+            continue
+
+        # Plot overlay
+        fig, ax = plt.subplots(figsize=(10, 6))
+        for idx in indices:
+            sensor_name = sensor_names[idx]
+            ch_type = get_channel_type(ev.info, idx)
+            if ch_type not in ('mag', 'grad', 'eeg'):
+                continue
+            units = UNITS[ch_type]
+            scale = SCALE[ch_type]
+            signal = ev.data[idx, :] * scale
+            plt.plot(ev.times, signal, label=f"{sensor_name} ({ch_type})")
+
+        plt.title(f"Multi-Sensor Overlay: {ev.comment}")
         plt.xlabel('Time (s)')
         plt.ylabel("Amplitude")
         plt.legend()
@@ -570,6 +429,9 @@ def multi_sensor_overlay(evokeds):
         plt.ylim((y_min, y_max))
         plt.grid(True)
         plt.show(block=False)
+
+        # Bring terminal to foreground
+        focus_terminal()
 
         print("\nCurrently overlaying sensors: " +
               ', '.join([sensor_names[i] for i in indices]))
@@ -661,6 +523,270 @@ def available_types(ev):
     all_types = set(ev.get_channel_types())
     return [t for t in ('mag', 'grad', 'eeg') if t in all_types]
 
+def compute_gfp(evoked, ch_type='all'):
+    """
+    Compute Global Field Power (GFP) for specified channel type.
+    GFP is the standard deviation across all sensors at each time point.
+    
+    Parameters:
+    - evoked: MNE Evoked object
+    - ch_type: 'all', 'mag', 'grad', or 'eeg'
+    
+    Returns:
+    - times: time points
+    - gfp: GFP values
+    """
+    import numpy as np
+    
+    if ch_type == 'all':
+        # Use all channels except stim, misc, etc.
+        picks = mne.pick_types(evoked.info, meg=True, eeg=True, exclude='bads')
+    elif ch_type in ['mag', 'grad']:
+        picks = mne.pick_types(evoked.info, meg=ch_type, eeg=False, exclude='bads')
+    elif ch_type == 'eeg':
+        picks = mne.pick_types(evoked.info, meg=False, eeg=True, exclude='bads')
+    else:
+        raise ValueError(f"Unknown channel type: {ch_type}")
+    
+    if len(picks) == 0:
+        return evoked.times, np.zeros_like(evoked.times)
+    
+    # Get data for selected channels and scale appropriately
+    data = evoked.data[picks, :]
+    
+    # Apply scaling to get proper units
+    if ch_type in SCALE:
+        data = data * SCALE[ch_type]
+    elif ch_type == 'all':
+        # For 'all', we need to scale different channel types appropriately
+        scaled_data = []
+        for pick in picks:
+            ch_type_single = get_channel_type(evoked.info, pick)
+            if ch_type_single in SCALE:
+                scaled_data.append(evoked.data[pick, :] * SCALE[ch_type_single])
+            else:
+                scaled_data.append(evoked.data[pick, :])
+        data = np.array(scaled_data)
+    
+    # Compute GFP (standard deviation across channels at each time point)
+    gfp = np.std(data, axis=0)
+    
+    return evoked.times, gfp
+
+def gfp_browser(evokeds):
+    """Browse Global Field Power (GFP) for different channel types and conditions."""
+    print("\n=== Global Field Power (GFP) Browser ===")
+    print("GFP shows the overall field strength across all sensors of a given type.")
+    
+    # Display available conditions
+    print("\nAvailable conditions:")
+    for i, ev in enumerate(evokeds, 1):
+        print(f"  ({i}) {ev.comment}")
+    
+    # Prompt for conditions to overlay
+    cond_indices = prompt_for_conditions(evokeds)
+    if cond_indices is None:
+        return
+    
+    # Determine available channel types
+    available_ch_types = available_types(evokeds[0])
+    if not available_ch_types:
+        print("No plottable channel types found.")
+        return
+    
+    # Add 'all' as an option if we have any channels
+    gfp_types = ['all'] + available_ch_types
+    current_type_idx = 0
+    
+    # Colors for conditions
+    colors = ['blue', 'red', 'green', 'purple', 'orange', 'brown', 'pink', 'gray']
+    
+    # Set up Y-limits for GFP (these are reasonable defaults for GFP)
+    gfp_ylims = {
+        'all': (0, 100),    # Mixed units, approximate
+        'mag': (0, 200),    # fT
+        'grad': (0, 100),   # fT/cm  
+        'eeg': (0, 20)      # μV
+    }
+    current_ylims = gfp_ylims.copy()
+    
+    while True:
+        # Current GFP type
+        gfp_type = gfp_types[current_type_idx]
+        
+        # Determine units for display
+        if gfp_type == 'all':
+            units = 'mixed'
+        else:
+            units = UNITS.get(gfp_type, 'AU')
+        
+        print(f"\nPlotting GFP for: {gfp_type} channels")
+        
+        # Create the plot
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        # Plot GFP for each selected condition
+        for i, cond_idx in enumerate(cond_indices):
+            ev = evokeds[cond_idx]
+            times, gfp_values = compute_gfp(ev, gfp_type)
+            
+            label = f"{ev.comment}"
+            color = colors[i % len(colors)]
+            ax.plot(times, gfp_values, label=label, color=color, linewidth=2)
+        
+        # Set plot properties
+        xlim = [evokeds[0].times[0], evokeds[0].times[-1]]
+        ylim = current_ylims[gfp_type]
+        
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+        ax.set_xlabel('Time (s)', fontsize=12)
+        ax.set_ylabel(f'GFP ({units})', fontsize=12)
+        ax.set_title(f'Global Field Power - {gfp_type} channels', fontsize=14)
+        ax.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+        ax.axvline(x=0, color='black', linestyle='--', linewidth=0.5)
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc='upper right')
+        plt.tight_layout()
+        plt.show(block=False)
+        
+        # Bring terminal to foreground
+        focus_terminal()
+        
+        # Navigation prompt
+        print(f"\nCurrently showing: {gfp_type} (option {current_type_idx + 1}/{len(gfp_types)})")
+        print("Options:")
+        print("  Press 'Enter' for next channel type")
+        print("  Type 'p' for previous channel type")
+        print(f"  Type 1-{len(gfp_types)} to jump to specific type: {', '.join([f'{i+1}={t}' for i, t in enumerate(gfp_types)])}")
+        print("  Type 'scale' to adjust y-limits")
+        print("  Type 'axis' to set custom axis limits")
+        print("  Type 'cond' to change conditions")
+        print("  Type 'close' to close plots")
+        print("  Type 'quit' to exit GFP browser")
+        
+        nav = input("Your choice: ").strip().lower()
+        
+        if nav == 'quit':
+            break
+        elif nav == '' or nav == 'n':
+            current_type_idx = (current_type_idx + 1) % len(gfp_types)
+        elif nav == 'p':
+            current_type_idx = (current_type_idx - 1) % len(gfp_types)
+        elif nav.isdigit():
+            idx = int(nav) - 1
+            if 0 <= idx < len(gfp_types):
+                current_type_idx = idx
+            else:
+                print(f"Invalid index. Must be 1-{len(gfp_types)}.")
+        elif nav == 'scale':
+            # Adjust Y-limits for current GFP type
+            print(f"Adjusting Y-limits for {gfp_type} GFP")
+            default = current_ylims[gfp_type]
+            entry = input(f"Enter Y-axis limits (min,max) [current: {default[0]},{default[1]}]: ").strip()
+            if entry:
+                try:
+                    ymin, ymax = [float(x) for x in entry.split(',')]
+                    current_ylims[gfp_type] = (ymin, ymax)
+                except Exception:
+                    print("Invalid input, keeping current limits.")
+        elif nav == 'axis':
+            xlim_new, ylim_new = prompt_for_axis_limits(xlim, ylim, units)
+            xlim = xlim_new
+            current_ylims[gfp_type] = ylim_new
+        elif nav == 'cond':
+            new_conds = prompt_for_conditions(evokeds)
+            if new_conds:
+                cond_indices = new_conds
+        elif nav in ('close', 'closeall', 'c'):
+            plt.close('all')
+            print("All plot windows closed.")
+        else:
+            print(f"Unknown command: '{nav}'")
+    
+    print("GFP browser complete.\n")
+
+def show_sensor_layout(evokeds):
+    """Show sensor layout reference map with sensor names."""
+    print("\n=== Sensor Layout Reference ===")
+    
+    # Use the first evoked object's info for sensor positions
+    info = evokeds[0].info
+    
+    # Determine what types of sensors we have
+    available_ch_types = available_types(evokeds[0])
+    
+    print("This will display sensor positions with labels.")
+    print(f"Available sensor types: {', '.join(available_ch_types)}")
+    
+    # Options for what to display
+    print("\nDisplay options:")
+    print("  (1) All sensors")
+    print("  (2) Magnetometers only") 
+    print("  (3) Gradiometers only")
+    print("  (4) EEG only (if available)")
+    print("  (q) Cancel")
+    
+    choice = input("Select option: ").strip().lower()
+    
+    if choice == 'q':
+        return
+    
+    # Determine which sensors to show
+    if choice == '2' and 'mag' in available_ch_types:
+        picks = mne.pick_types(info, meg='mag', exclude=[])
+        title = "Magnetometer Layout"
+    elif choice == '3' and 'grad' in available_ch_types:
+        picks = mne.pick_types(info, meg='grad', exclude=[])
+        title = "Gradiometer Layout"
+    elif choice == '4' and 'eeg' in available_ch_types:
+        picks = mne.pick_types(info, meg=False, eeg=True, exclude=[])
+        title = "EEG Layout"
+    else:
+        # Default to all sensors
+        picks = mne.pick_types(info, meg=True, eeg=True, exclude=[])
+        title = "All Sensors Layout"
+    
+    if len(picks) == 0:
+        print("No sensors of that type found.")
+        return
+    
+    print(f"\nShowing layout for {len(picks)} sensors...")
+    print("TIP: You can use the last 3 digits shown here when navigating in other modes.")
+    
+    # Create the sensor layout plot
+    fig = mne.viz.plot_sensors(info, ch_type='all', picks=picks, 
+                                show_names=True, show=False, 
+                                title=title, block=False)
+    
+    # Make the plot a bit larger for better readability
+    if fig:
+        fig.set_size_inches(12, 10)
+    
+    plt.show(block=False)
+    
+    # Add a simple legend/guide
+    print("\n" + "="*60)
+    print("SENSOR NAMING CONVENTION:")
+    print("  MEG####:")
+    print("    - First digit (0-2): Region")
+    print("      0 = Frontal/Central")
+    print("      1 = Left hemisphere") 
+    print("      2 = Right hemisphere")
+    print("    - Last digit:")
+    print("      1 = Magnetometer")
+    print("      2,3 = Gradiometer pair")
+    print("\nNAVIGATION TIPS:")
+    print("  - In browsers, type the last 3 digits to jump to a sensor")
+    print("  - Or type the full name (e.g., MEG0111)")
+    print("  - Sensors are roughly organized in a grid pattern")
+    print("="*60)
+    
+    print("\nPress Enter to continue...")
+    input()
+    
+    focus_terminal()
+
 def main():
     if len(sys.argv) != 2:
         print("Usage: python visualize_evoked_BIDS.py <config.yaml | evoked-ave-file.fif>")
@@ -670,7 +796,7 @@ def main():
     if arg.suffix in ('.yaml', '.yml'):
         # YAML mode
         with open(arg, 'r') as f:
-            config = yaml.safe_load(f)
+            config = yaml_safe_load(f)
         try:
             evoked_fname = build_evoked_fname(config)
         except Exception as e:
@@ -697,9 +823,12 @@ def main():
         print("  (1) Plot Butterfly/Topomap")
         print("  (2) Plot Waveforms (single sensor, overlay conditions)")
         print("  (3) Overlay Sensors (single condition, multiple sensors)")
+        print("  (4) Interactive Sensor Layout (click sensors for waveforms)")
+        print("  (5) Global Field Power (GFP) browser")
+        print("  (6) Show Sensor Layout Reference")
         print("  (c) Close all open plots")
         print("  (q) Quit")
-        choice = input("Select option (1/2/3/c/q): ").strip().lower()
+        choice = input("Select option (1/2/3/4/5/6/c/q): ").strip().lower()
 
         if choice == '1':
             # Topomap/Butterfly loop
@@ -750,17 +879,88 @@ def main():
         elif choice == '3':
             multi_sensor_overlay(evokeds)
             # multi_sensor_overlay already calls focus_terminal() internally
+        elif choice == '4':
+            # Interactive sensor layout with plot_topo
+            print("\n=== Interactive Sensor Layout ===")
+            print("Available conditions:")
+            for i, ev in enumerate(evokeds, 1):
+                print(f"  ({i}) {ev.comment}")
+            
+            # Select conditions to display
+            print("\nYou can plot multiple conditions overlaid on the same sensors.")
+            cond_str = input("Enter condition numbers (comma-separated, or 'all' for all conditions): ").strip()
+            
+            if cond_str.lower() == 'all':
+                selected_evokeds = evokeds
+                print(f"Plotting all {len(evokeds)} conditions")
+            else:
+                try:
+                    indices = [int(x.strip())-1 for x in cond_str.split(',') if x.strip()]
+                    if all(0 <= i < len(evokeds) for i in indices):
+                        selected_evokeds = [evokeds[i] for i in indices]
+                        print(f"Plotting conditions: {', '.join([ev.comment for ev in selected_evokeds])}")
+                    else:
+                        print("Invalid selection, using first condition only.")
+                        selected_evokeds = [evokeds[0]]
+                except Exception:
+                    print("Invalid input, using first condition only.")
+                    selected_evokeds = [evokeds[0]]
+            
+            # Create the interactive plot
+            print("\nCreating interactive sensor layout plot...")
+            print("Click on any sensor to see its detailed waveform in a popup window.")
+            print("Note: The plot may take a moment to appear.")
+            print("This will show all channel types (mag, grad, eeg) present in the data.")
+            
+            # Plot first condition and overlay others if selected
+            if len(selected_evokeds) == 1:
+                # Single condition - simple plot
+                fig = selected_evokeds[0].plot_topo(
+                    show=False,
+                    title=f"Interactive Layout: {selected_evokeds[0].comment}"
+                )
+            else:
+                # Multiple conditions - plot them using merge
+                from mne import combine_evoked
+                
+                # Create a list of evokeds with weights for combining
+                all_evokeds = []
+                for ev in selected_evokeds:
+                    all_evokeds.append(ev)
+                
+                # Plot first one
+                fig = selected_evokeds[0].plot_topo(
+                    show=False,
+                    title=f"Interactive Layout: {len(selected_evokeds)} conditions"
+                )
+                
+                print(f"Note: plot_topo shows the first condition ({selected_evokeds[0].comment}).")
+                print("For overlaid conditions, use option 2 or 3 from the main menu.")
+            
+            plt.show(block=False)
+            focus_terminal()
+            
+            print("\nInteractive plot displayed. Click on sensors to view details.")
+            print("Keep this plot open and return here to select other menu options.")
+            
+        elif choice == '5':
+            gfp_browser(evokeds)
+            # gfp_browser already calls focus_terminal() internally
+        
+        elif choice == '6':
+            show_sensor_layout(evokeds)
+            # show_sensor_layout already calls focus_terminal() internally
+            
         elif choice in ('c', 'close', 'closeall'):
             plt.close('all')
             print("All plot windows closed.")
-        elif choice in ('4', 'q', 'quit', 'exit'):
+        elif choice in ('q', 'quit', 'exit'):
             print("Exiting program.")
             break
         else:
-            print("Invalid selection. Please type 1, 2, 3, or 'q' to quit.")
+            print("Invalid selection. Please type 1, 2, 3, 4, 5, 6, or 'q' to quit.")
 
     print("Visualization complete.")
 
 if __name__ == '__main__':
     main()
-    
