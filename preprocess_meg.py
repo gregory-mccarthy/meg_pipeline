@@ -45,6 +45,16 @@ import json
 import numpy as np
 import matplotlib
 
+import bids_io_utils as utils
+
+#from bids_io_utils_v2 import (
+#    fetch_bids_data_and_sidecars,
+#    push_bids_derivatives_rsync,
+#    detect_environment,
+#    write_bids_robust,
+#    read_raw_bids_robust,
+#    get_all_bids_split_files,
+#)
 
 def _in_slurm() -> bool:
     return any(k in os.environ for k in ("SLURM_JOB_ID", "SLURM_JOB_NAME", "SLURM_SUBMIT_DIR"))
@@ -71,7 +81,7 @@ except ImportError:
     import meg_pipeline_utils as utils
 
 try:
-    from transfer_manager_v2 import HybridTransferManager
+    from transfer_manager_v3 import HybridTransferManager
 except ImportError:
     HybridTransferManager = None
 
@@ -976,7 +986,12 @@ def maybe_hybrid_prefetch(cfg: dict) -> tuple[dict, bool, bool, str, str]:
         sys.exit(1)
 
     logger.info("HYBRID: Prefetching raw + derivatives to local temp (single Duo auth)")
-    tm = HybridTransferManager(hpc_host, hpc_user, local_temp_dir)
+    tm = HybridTransferManager(
+        hpc_host, hpc_user, local_temp_dir,
+        use_multiplex=True,
+        verbose=False,  # <= avoids --info=... on older rsync
+        dry_run=False,
+    )
     try:
         local_bids_root, checkpoint_exists = tm.fetch_all_bids_data(
             cfg["subject"], cfg.get("session"), cfg.get("task"), cfg.get("run"),

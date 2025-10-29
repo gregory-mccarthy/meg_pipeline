@@ -1,347 +1,435 @@
 #!/usr/bin/env python3
 """
-transfer_manager.py
+transfer_manager_v3.py
 
-High-level, TFA-aware transfer utilities for BIDS MEG datasets.
+HybridTransferManager (v3): class-based API that keeps the original v1 surface
+while incorporating v2 improvements and recent fixes:
 
-Goals:
-- Minimize SSH/TFA prompts by performing large, batched rsync operations
-  (ideally ONE rsync per fetch/push).
-- Support both BIDS split style (..._split-01_meg.fif, _split-02_...) and
-  legacy MEGIN style (..._meg.fif, ..._meg-1.fif, ..._meg-2.fif).
-- Support optional run entity (run can be None / null / '' in YAML).
-- Zero shell globbing on the remote host beyond rsync itself (no extra ssh).
-- Optional SSH multiplexing (ControlMaster) to reuse an authenticated session.
+- Single-rsync philosophy to minimize Duo/TFA prompts.
+- Robust include patterns for both BIDS split files (*_split-*_meg.fif)
+  and legacy MEGIN parts (*_meg.fif, *_meg-*.fif).
+- Optional SSH multiplexing (ControlMaster) to reuse one authenticated session.
+- Functional parity with prior versions:
+    - fetch_all_bids_data(...) -> (local_bids_root:str, checkpoint_exists:bool)
+    - push_results(...): push derivatives (and optionally raw sidecar updates)
+- Preflight probe via remote_meg_exists(...)
+- Dry-run and verbose flags for safety and logging.
 
-Typical use:
-    from transfer_manager import (
-        fetch_meg_run, fetch_meg_subject_session, push_derivatives
-    )
-
-    # Fetch a single run in 1 rsync:
-    fetch_meg_run(
-        remote_root="/gpfs/milgram/scratch/mccarthy/gm33/BIDS/epi",
-        local_root="~/BIDS/epi",
-        subject="001", session="01", task="fairy", run=None,   # run: None → no run entity
-        host="hpc.yale.edu", user="gm33",
-        use_multiplex=True, verbose=True
-    )
-
-    # Fetch all runs for sub+ses in 1 rsync:
-    fetch_meg_subject_session(
-        remote_root="/gpfs/milgram/scratch/mccarthy/gm33/BIDS/epi",
-        local_root="~/BIDS/epi",
-        subject="001", session="01", task=None,
-        host="hpc.yale.edu", user="gm33",
-        use_multiplex=True, verbose=True
-    )
-
-    # Push entire derivatives tree in 1 rsync:
-    push_derivatives(
-        local_root="~/BIDS/epi",
-        remote_root="/gpfs/milgram/scratch/mccarthy/gm33/BIDS/epi",
-        host="hpc.yale.edu", user="gm33",
-        use_multiplex=True, verbose=True
-    )
+Fixes relative to earlier drafts:
+- Uses legacy-safe rsync flags (--stats --progress -v) instead of --info=...
+- SIDECARES ARE TASK/RUN-SCOPED so we do not pull other tasks.
+- Correct filename stem (sub-XXX[_ses-YYY] with underscores, not slashes).
+- Defensive guards to avoid None / empty include lists.
 """
 
 from __future__ import annotations
 
 import os
-import re
 import shlex
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import List, Optional, Tuple
 
-# --------------------------------------------------------------------------------------
-# Small, local helpers (no external deps). We intentionally do not import bids_io_utils
-# to keep this module standalone for transfers.
-# --------------------------------------------------------------------------------------
 
-def _none_like(x) -> bool:
-    return x in (None, "", False, "None", "null", "NULL")
+def _expand(p: os.PathLike | str) -> Path:
+    return Path(p).expanduser().resolve()
 
-def _norm_run(val) -> Optional[str]:
-    """Normalize run to a zero-padded 2-digit string or None."""
-    if _none_like(val):
-        return None
-    s = str(val)
-    return s.zfill(2) if s.isdigit() else s
 
-def _ent(stem: str, key: str, val: Optional[str]) -> str:
-    return f"{stem}_{key}-{val}" if not _none_like(val) else stem
+@dataclass
+class SSHOptions:
+    host: str
+    user: str
+    use_multiplex: bool = True
+    control_dir: Optional[Path] = None
+    port: Optional[int] = None  # allow non-standard ports if needed
 
-def build_bids_stem(subject: str,
-                    session: Optional[str] = None,
-                    task: Optional[str] = None,
-                    run: Optional[str] = None) -> str:
-    """sub-001[_ses-01][_task-fairy][_run-02]"""
-    run = _norm_run(run)
-    stem = f"sub-{subject}"
-    stem = _ent(stem, "ses", session)
-    stem = _ent(stem, "task", task)
-    stem = _ent(stem, "run", run)
-    return stem
+    def control_path(self) -> Optional[Path]:
+        if not self.use_multiplex:
+            return None
+        base = self.control_dir or _expand("~/.ssh")
+        base.mkdir(parents=True, exist_ok=True)
+        # OpenSSH requires a literal path; %r,%h,%p get expanded by ssh itself.
+        return base / "cm-%r@%h:%p"
 
-def meg_dir(root: Union[str, Path], subject: str, session: Optional[str] = None) -> Path:
-    """<root>/sub-<subject>/[ses-<session>/]meg"""
-    root = Path(root).expanduser().resolve()
-    parts = [root, f"sub-{subject}"]
-    if not _none_like(session):
-        parts.append(f"ses-{session}")
-    parts.append("meg")
-    return Path(*parts)
+    def ssh_base_args(self) -> List[str]:
+        args = ["ssh"]
+        if self.port:
+            args += ["-p", str(self.port)]
+        if self.use_multiplex:
+            cp = str(self.control_path())
+            args += [
+                "-o", "ControlMaster=auto",
+                "-o", f"ControlPath={cp}",
+                "-o", "ControlPersist=600",
+            ]
+        return args
 
-# --------------------------------------------------------------------------------------
-# SSH / rsync plumbing with optional ControlMaster (SSH multiplexing).
-# --------------------------------------------------------------------------------------
+    def rsync_ssh(self) -> str:
+        # Build the -e "ssh ..." payload for rsync
+        return " ".join(shlex.quote(x) for x in self.ssh_base_args())
 
-def _ssh_cmd_base(use_multiplex: bool) -> List[str]:
+    def open_master(self) -> None:
+        if not self.use_multiplex:
+            return
+        args = self.ssh_base_args() + ["-MNf", f"{self.user}@{self.host}"]
+        # Ignore errors if already open
+        try:
+            subprocess.run(args, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except Exception:
+            pass
+
+    def close_master(self) -> None:
+        if not self.use_multiplex:
+            return
+        args = self.ssh_base_args() + ["-O", "exit", f"{self.user}@{self.host}"]
+        subprocess.run(args, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+class HybridTransferManager:
     """
-    Return an SSH command prefix for rsync's -e option.
-    We return a list suitable for: rsync ... -e 'ssh ...'
+    Class wrapper matching the original v1 surface while using improved v2 logic.
+
+    Typical use:
+        tm = HybridTransferManager(hpc_host, hpc_user, local_temp_dir)
+        local_root, ckpt = tm.fetch_all_bids_data(sub, ses, task, run, remote_bids_root)
+        rc = tm.push_results(local_root, remote_bids_root, sub, ses, push_raw_sidecars=False)
     """
-    base = ["ssh"]
-    if use_multiplex:
-        # Reuse an authenticated control connection if permitted by IT policy.
-        # First rsync will do the TFA; subsequent rsyncs reuse the control socket.
-        base += [
-            "-o", "ControlMaster=auto",
-            "-o", "ControlPersist=300s",
-            "-o", "ControlPath=~/.ssh/cm-%r@%h:%p"
+
+    def __init__(
+        self,
+        host: str,
+        user: str,
+        local_temp_dir: str | os.PathLike,
+        *,
+        use_multiplex: bool = True,
+        control_dir: Optional[str | os.PathLike] = None,
+        dry_run: bool = False,
+        verbose: bool = True,
+        delete: bool = False,
+        fetch_derivatives: bool = False,
+    ) -> None:
+        self.ssh = SSHOptions(
+            host=host,
+            user=user,
+            use_multiplex=use_multiplex,
+            control_dir=_expand(control_dir) if control_dir else None,
+        )
+        self.local_root = _expand(local_temp_dir)
+        self.local_root.mkdir(parents=True, exist_ok=True)
+        self.dry_run = dry_run
+        self.verbose = verbose
+        self.delete = delete
+        self.fetch_derivatives = fetch_derivatives
+
+    # ------------------------- Public API -------------------------
+
+    def fetch_all_bids_data(
+            self,
+            subject: str,
+            session: Optional[str],
+            task: Optional[str],
+            run: Optional[str],
+            remote_bids_root: str | os.PathLike,
+    ) -> Tuple[str, bool]:
+        """
+        Robust fetch: rsync directly from the remote MEG directory into the local MEG directory,
+        including only the run stem and the (session) coordsystem file.
+        """
+        self.ssh.open_master()
+        remote_root = _expand(remote_bids_root)
+
+        # Directory vs filename stems (slash vs underscore)
+        base_dir = f"sub-{subject}" + (f"/ses-{session}" if session and str(session).strip() else "")
+        base_file = f"sub-{subject}" + (f"_ses-{session}" if session and str(session).strip() else "")
+        remote_meg_dir = remote_root / base_dir / "meg"
+        local_meg_dir = self.local_root / base_dir / "meg"
+        local_meg_dir.mkdir(parents=True, exist_ok=True)
+
+        if not task or not str(task).strip():
+            raise ValueError("Explicit task required, e.g., task='rest'.")
+        if not run or not str(run).strip():
+            raise ValueError("Explicit run required, e.g., run='01'.")
+
+        stem = f"{base_file}_task-{task}_run-{run}"
+
+        # Minimal include set at the MEG-dir root
+        includes: List[str] = [
+            f"{stem}*",  # everything for this run (FIF, parts, splits, sidecars)
+            f"{base_file}_coordsystem.json",  # session coordsystem (if present)
         ]
-    return base
 
-def _rsync_common_args(verbose: bool, preserve_times: bool = True) -> List[str]:
-    # -a: archive; -z: compress; --update: skip newer on receiver
-    args = ["rsync", "-avz", "--update"]
-    if preserve_times:
-        args += ["--times"]
-    if verbose:
-        args += ["--progress"]
-    return args
+        # Build rsync command: from the MEG dir to the local MEG dir
+        args = [
+            "rsync", "-a", "--partial", "--prune-empty-dirs",
+            "--stats", "--progress", "-v",
+            "-e", self.ssh.rsync_ssh(),
+        ]
+        for pat in includes:
+            args += ["--include", pat]
+        args += ["--exclude", "*"]
+        args += [
+            f"{self.ssh.user}@{self.ssh.host}:{str(remote_meg_dir)}/",
+            str(local_meg_dir) + "/",
+        ]
 
-def _run_subprocess(cmd: Sequence[str], dry_run: bool = False, verbose: bool = True) -> None:
-    if verbose:
-        print("[transfer_manager] Running:", " ".join(shlex.quote(c) for c in cmd))
-    if dry_run:
-        return
-    subprocess.run(cmd, check=True)
+        # Always show the exact command we run
+        print("\n================ RSYNC COMMAND ====================")
+        print(" ".join(shlex.quote(a) for a in args))
+        print("===================================================\n")
 
-# --------------------------------------------------------------------------------------
-# INCLUDE/EXCLUDE patterns to pull exactly what we need in ONE rsync.
-# --------------------------------------------------------------------------------------
+        cp = subprocess.run(args, check=False)
+        if cp.returncode != 0 and not self.dry_run:
+            raise RuntimeError(f"Command failed (exit {cp.returncode}): {' '.join(args)}")
 
-# Core sidecars expected in /meg for each run
-_MEG_SIDECARS = [
-    "_meg.json",
-    "_channels.tsv",
-    "_coordsystem.json",
-    "_events.tsv",         # optional but common
-    "_scans.tsv",          # often up at session level, but include in case it’s placed here
-    "_headpos.pos",        # your center convention
-    "_headshape.*",        # if present
-]
+        # Verify we actually have the MEG directory and at least one FIF now
+        if not local_meg_dir.exists():
+            raise FileNotFoundError(f"Fetch finished but MEG directory is missing locally: {local_meg_dir}")
+        fif_matches = list(local_meg_dir.glob(f"{stem}_meg*.fif")) + list(
+            local_meg_dir.glob(f"{stem}_split-*_meg*.fif"))
+        if not fif_matches:
+            # list what we *do* have to aid debugging
+            present = "\n".join(f"  - {p.name}" for p in sorted(local_meg_dir.glob("*")))
+            raise FileNotFoundError(
+                f"No FIF files copied for stem '{stem}' into {local_meg_dir}\n"
+                f"Present files:\n{present if present else '  (none)'}"
+            )
 
-def _include_patterns_for_run(stem: str) -> List[str]:
-    """
-    Build rsync --include patterns for a single run (or single-run w/o run entity).
-    We include both split styles and common sidecars.
-    """
-    pats: List[str] = []
+        ckpt = self._detect_checkpoint(self.local_root, subject, session)
+        return (str(self.local_root), ckpt)
 
-    # FIF data — both split styles
-    pats.append(f"{stem}_split-*_meg.fif")  # BIDS split
-    pats.append(f"{stem}_meg.fif")          # single or base legacy
-    pats.append(f"{stem}_meg-*.fif")        # legacy numbered parts
+    def push_results(
+        self,
+        local_bids_root: str | os.PathLike,
+        remote_bids_root: str | os.PathLike,
+        subject: str,
+        session: Optional[str],
+        *,
+        push_raw_sidecars: bool = False,
+    ) -> int:
+        """
+        Push derivatives for a subject[/session] back to remote using a single rsync call.
+        If push_raw_sidecars=True, also include commonly edited raw sidecars.
+        Returns 0 on success.
+        """
+        self.ssh.open_master()
+        local_root = _expand(local_bids_root)
+        remote_root = _expand(remote_bids_root)
 
-    # Sidecars in MEG folder for this stem
-    for suffix in _MEG_SIDECARS:
-        pats.append(f"{stem}{suffix}")
+        includes = self._build_derivatives_includes(subject, session)
+        if push_raw_sidecars:
+            includes += self._build_includes(subject, session, task=None, run=None, raw_sidecars=True, fif_files=False)
 
-    return pats
+        if not includes:
+            raise ValueError("No include patterns were generated for push; this should not happen.")
 
-def _include_patterns_for_subject_session(subject: str,
-                                          session: Optional[str],
-                                          task: Optional[str]) -> List[str]:
-    """
-    Build patterns that match ALL runs (and also the single-run case)
-    for a given subject/session[/task], in one rsync.
-    """
-    pats: List[str] = []
+        self._rsync_push(local_root, remote_root, includes)
+        return 0
 
-    # Base stems:
-    stem_norun = build_bids_stem(subject, session, task, run=None)        # no run entity
-    stem_anyrun = f"{stem_norun}_run-*"                                   # any run
+    def remote_meg_exists(
+        self,
+        remote_bids_root: str | os.PathLike,
+        subject: str,
+        session: Optional[str] = None,
+    ) -> bool:
+        """
+        Lightweight probe to check if sub[/ses] MEG files exist remotely.
+        Uses rsync --list-only with include patterns.
+        """
+        remote_root = _expand(remote_bids_root)
+        incl = self._build_includes(subject, session, task=None, run=None, raw_sidecars=False, fif_files=True)
+        return self._rsync_probe(remote_root, incl)
 
-    # For "no run" (single-run datasets)
-    pats += _include_patterns_for_run(stem_norun)
+    # ------------------------- Internal helpers -------------------------
 
-    # For "any run"
-    pats += _include_patterns_for_run(stem_anyrun)
+    def _rsync_common_args(self) -> List[str]:
+        args = [
+            "rsync",
+            "-a",                    # archive preserves perms/times/links
+            "--partial",
+            "--prune-empty-dirs",
+        ]
+        if self.verbose:
+            # Compatible with older rsync (no --info=stats2,progress2)
+            args += ["--stats", "--progress", "-v"]
+        if self.dry_run:
+            args += ["--dry-run"]
+        if self.delete:
+            args += ["--delete"]
+        return args
 
-    return pats
+    def _rsync_pull(self, remote_root: Path, local_root: Path, includes: List[str]) -> None:
+        if not includes:
+            raise ValueError("rsync pull called with empty or None include set.")
+        args = self._rsync_common_args()
+        # Exclude everything by default, then include our whitelist
+        for pat in includes:
+            args += ["--include", pat]
+        args += ["--exclude", "*"]
 
-# --------------------------------------------------------------------------------------
-# Fetch functions (ONE rsync each)
-# --------------------------------------------------------------------------------------
+        remote = f"{self.ssh.user}@{self.ssh.host}:{str(remote_root)}/"
+        args += ["-e", self.ssh.rsync_ssh()]
+        args += [remote, str(local_root) + "/"]
 
-def fetch_meg_run(remote_root: Union[str, Path],
-                  local_root: Union[str, Path],
-                  subject: str,
-                  session: Optional[str],
-                  task: Optional[str],
-                  run: Optional[str],
-                  host: str,
-                  user: str,
-                  use_multiplex: bool = True,
-                  delete_extraneous: bool = False,
-                  dry_run: bool = False,
-                  verbose: bool = True) -> Path:
-    """
-    Fetch exactly one run (or a single-run dataset with run=None) in ONE rsync call.
-    Downloads both FIF data and sidecars into local BIDS tree.
+        self._run(args)
 
-    Returns the local meg dir path.
-    """
-    run = _norm_run(run)
-    remote_meg = meg_dir(remote_root, subject, session)
-    local_meg = meg_dir(local_root, subject, session)
-    local_meg.mkdir(parents=True, exist_ok=True)
+    def _rsync_push(self, local_root: Path, remote_root: Path, includes: List[str]) -> None:
+        if not includes:
+            raise ValueError("rsync push called with empty or None include set.")
+        args = self._rsync_common_args()
+        for pat in includes:
+            args += ["--include", pat]
+        args += ["--exclude", "*"]
 
-    stem = build_bids_stem(subject, session, task, run)
-    include = _include_patterns_for_run(stem)
+        src = str(local_root) + "/"
+        dest = f"{self.ssh.user}@{self.ssh.host}:{str(remote_root)}/"
 
-    # Build rsync command
-    cmd = _rsync_common_args(verbose=verbose)
-    if delete_extraneous:
-        cmd += ["--delete"]
+        args += ["-e", self.ssh.rsync_ssh()]
+        args += [src, dest]
 
-    # Include patterns first, then a terminal exclude-all to limit transfer
-    for pat in include:
-        cmd += ["--include", pat]
-    cmd += ["--exclude", "*"]
+        self._run(args)
 
-    # SSH transport (single connection)
-    ssh_cmd = _ssh_cmd_base(use_multiplex=use_multiplex)
-    cmd += ["-e", " ".join(ssh_cmd)]
+    def _rsync_probe(self, remote_root: Path, includes: List[str]) -> bool:
+        # Use --list-only to avoid copying anything.
+        args = ["rsync", "-a", "--list-only"]
+        for pat in includes:
+            args += ["--include", pat]
+        args += ["--exclude", "*"]
+        remote = f"{self.ssh.user}@{self.ssh.host}:{str(remote_root)}/"
+        args += ["-e", self.ssh.rsync_ssh(), remote, "/dev/null"]  # dummy sink
 
-    # Source and destination
-    src = f"{user}@{host}:{str(remote_meg)}/"   # trailing slash = dir contents
-    dst = f"{str(local_meg)}/"
-    cmd += [src, dst]
+        try:
+            cp = subprocess.run(args, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            # If any file is listed, stdout will have lines.
+            return bool(cp.stdout.strip())
+        except Exception:
+            return False
 
-    _run_subprocess(cmd, dry_run=dry_run, verbose=verbose)
-    return local_meg
+    def _run(self, args: List[str]) -> None:
+        # Always print the full command being executed
+        print("\n================ RSYNC COMMAND ====================")
+        print(" ".join(shlex.quote(a) for a in args))
+        print("===================================================\n")
 
-def fetch_meg_subject_session(remote_root: Union[str, Path],
-                              local_root: Union[str, Path],
-                              subject: str,
-                              session: Optional[str],
-                              task: Optional[str],
-                              host: str,
-                              user: str,
-                              use_multiplex: bool = True,
-                              delete_extraneous: bool = False,
-                              dry_run: bool = False,
-                              verbose: bool = True) -> Path:
-    """
-    Fetch ALL runs (and the single-run case) for subject/session[/task] in ONE rsync.
-    If task is None, we fetch all tasks for this sub/ses.
+        # actually execute it
+        cp = subprocess.run(args, check=False)
+        if cp.returncode != 0 and not self.dry_run:
+            raise RuntimeError(f"Command failed (exit {cp.returncode}): {' '.join(args)}")
 
-    Returns the local meg dir path.
-    """
-    remote_meg = meg_dir(remote_root, subject, session)
-    local_meg = meg_dir(local_root, subject, session)
-    local_meg.mkdir(parents=True, exist_ok=True)
+    # ------------------------- Pattern builders -------------------------
 
-    # If task is given, limit to that task; otherwise include all tasks for sub/ses.
-    if _none_like(task):
-        # All tasks: pattern uses 'task-*' stems
-        stem_task_any = build_bids_stem(subject, session, task="*")
-        include = _include_patterns_for_subject_session(subject, session, task="*")
-        # We also include subjects' session-level scans file if it happens to live here
-        include += [f"{stem_task_any}_scans.tsv"]
-    else:
-        include = _include_patterns_for_subject_session(subject, session, task)
+    @staticmethod
+    def _entity_prefix_dir(subject: str, session: Optional[str]) -> str:
+        """Directory prefix: 'sub-XXX[/ses-YYY]' (with slash)."""
+        if session and str(session).strip():
+            return f"sub-{subject}/ses-{session}"
+        return f"sub-{subject}"
 
-    cmd = _rsync_common_args(verbose=verbose)
-    if delete_extraneous:
-        cmd += ["--delete"]
+    @staticmethod
+    def _entity_prefix_file(subject: str, session: Optional[str]) -> str:
+        """Filename prefix: 'sub-XXX[_ses-YYY]' (with underscore)."""
+        if session and str(session).strip():
+            return f"sub-{subject}_ses-{session}"
+        return f"sub-{subject}"
 
-    for pat in include:
-        cmd += ["--include", pat]
-    cmd += ["--exclude", "*"]
+    def _build_includes(
+        self,
+        subject: str,
+        session: Optional[str],
+        task: Optional[str],
+        run: Optional[str],
+        *,
+        raw_sidecars: bool,
+        fif_files: bool = True,
+    ) -> List[str]:
+        """
+        Build include patterns for raw MEG (and optional sidecars).
 
-    ssh_cmd = _ssh_cmd_base(use_multiplex=use_multiplex)
-    cmd += ["-e", " ".join(ssh_cmd)]
+        Supports legacy FIF parts and BIDS split style, and constrains sidecars
+        to the requested task/run so we don't pull other tasks.
+        """
+        base_dir = self._entity_prefix_dir(subject, session)    # e.g., 'sub-011/ses-01'
+        base_fname = self._entity_prefix_file(subject, session) # e.g., 'sub-011_ses-01'
+        meg_dir = f"{base_dir}/meg"
 
-    src = f"{user}@{host}:{str(remote_meg)}/"
-    dst = f"{str(local_meg)}/"
-    cmd += [src, dst]
+        patterns: List[str] = [
+            base_dir,
+            f"{base_dir}/",
+            meg_dir,
+            f"{meg_dir}/",
+        ]
 
-    _run_subprocess(cmd, dry_run=dry_run, verbose=verbose)
-    return local_meg
+        # FIF patterns (supporting both legacy and BIDS split style)
+        if fif_files:
+            task_pat = f"task-{task}" if (task and str(task).strip()) else "task-*"
+            run_pat  = f"run-{run}"   if (run  and str(run).strip())  else "run-*"
+            stem = f"{base_fname}_{task_pat}_{run_pat}"
+            patterns += [
+                f"{meg_dir}/{stem}_meg.fif",
+                f"{meg_dir}/{stem}_meg-*.fif",
+                f"{meg_dir}/{stem}_split-*_meg.fif",
+            ]
 
-# --------------------------------------------------------------------------------------
-# Push derivatives (ONE rsync)
-# --------------------------------------------------------------------------------------
+        # Sidecars commonly needed for MEG processing (TASK/RUN scoped)
+        if raw_sidecars:
+            task_pat = f"task-{task}" if (task and str(task).strip()) else "task-*"
+            run_pat  = f"run-{run}"   if (run  and str(run).strip())  else "run-*"
+            stem = f"{base_fname}_{task_pat}_{run_pat}"
 
-def push_derivatives(local_root: Union[str, Path],
-                     remote_root: Union[str, Path],
-                     host: str,
-                     user: str,
-                     use_multiplex: bool = True,
-                     delete_extraneous: bool = False,
-                     dry_run: bool = False,
-                     verbose: bool = True) -> Path:
-    """
-    Push the entire derivatives tree from local_root → remote_root in ONE rsync.
-    """
-    local_deriv = Path(local_root).expanduser().resolve() / "derivatives"
-    remote_deriv = Path(remote_root).expanduser().resolve() / "derivatives"
+            # Per-recording sidecars
+            patterns += [
+                f"{meg_dir}/{stem}_channels.tsv",
+                f"{meg_dir}/{stem}_events.tsv",
+                f"{meg_dir}/{stem}_meg.json",
+                f"{meg_dir}/{stem}_headshape.*",
+                f"{meg_dir}/{stem}_headpos.*",
+                f"{meg_dir}/{stem}*.cal",
+                f"{meg_dir}/{stem}*.dat",
+            ]
 
-    if verbose:
-        print(f"[transfer_manager] Pushing derivatives: {local_deriv} → {user}@{host}:{remote_deriv}")
+            # Session-level coordsystem, narrowly scoped to THIS session
+            patterns += [f"{meg_dir}/{base_fname}_coordsystem.json"]
+            if session and str(session).strip():
+                patterns += [f"{meg_dir}/{base_fname}_ses-{session}_coordsystem.json"]
 
-    cmd = _rsync_common_args(verbose=verbose)
-    if delete_extraneous:
-        cmd += ["--delete"]
+        return patterns
 
-    ssh_cmd = _ssh_cmd_base(use_multiplex=use_multiplex)
-    cmd += ["-e", " ".join(ssh_cmd)]
+    def _build_derivatives_includes(self, subject: str, session: Optional[str]) -> List[str]:
+        base_dir = self._entity_prefix_dir(subject, session)    # 'sub-XXX[/ses-YYY]'
+        deriv = "derivatives"
+        # Allow traversal into derivatives tree, but limit to sub[/ses] subtree
+        return [
+            deriv,
+            f"{deriv}/",
+            f"{deriv}/**/",
+            f"{deriv}/**/{base_dir}/",
+            f"{deriv}/**/{base_dir}/**",
+        ]
 
-    src = f"{str(local_deriv)}/"                    # send contents only
-    dst = f"{user}@{host}:{str(remote_deriv)}"      # dst without trailing slash to create if needed
-    cmd += [src, dst]
+    # ------------------------- Checkpoint heuristic -------------------------
 
-    _run_subprocess(cmd, dry_run=dry_run, verbose=verbose)
-    return remote_deriv
+    def _detect_checkpoint(self, local_root: Path, subject: str, session: Optional[str]) -> bool:
+        """
+        Heuristic: look for common checkpoint markers under derivatives for this subject/session.
+        Adapt this to your pipeline's real checkpoint convention if needed.
+        """
+        base_dir = self._entity_prefix_dir(subject, session)
+        deriv = local_root / "derivatives"
+        if not deriv.exists():
+            return False
 
-# --------------------------------------------------------------------------------------
-# Optional: quick subject/session existence check (NO extra SSH—uses rsync dry-run).
-# --------------------------------------------------------------------------------------
-
-def remote_meg_exists(remote_root: Union[str, Path],
-                      subject: str,
-                      session: Optional[str],
-                      host: str,
-                      user: str,
-                      use_multiplex: bool = True,
-                      verbose: bool = True) -> bool:
-    """
-    Cheap existence probe using rsync --list-only (still one ssh, but avoids full copy).
-    If your IT policy prompts TFA for any SSH, call this only if necessary.
-    """
-    remote_meg_path = meg_dir(remote_root, subject, session)
-
-    cmd = ["rsync", "--list-only", "-e", " ".join(_ssh_cmd_base(use_multiplex))]
-    src = f"{user}@{host}:{str(remote_meg_path)}/"
-    cmd.append(src)
-
-    try:
-        _run_subprocess(cmd, dry_run=False, verbose=verbose)
-        return True
-    except subprocess.CalledProcessError:
+        # Common extensions or marker names (customize to your convention)
+        patterns = [
+            f"**/{base_dir}/**/*.ckpt",
+            f"**/{base_dir}/**/*.checkpoint",
+            f"**/{base_dir}/**/.checkpoint",
+            f"**/{base_dir}/**/CHECKPOINT*",
+            f"**/{base_dir}/**/*.stage-*",
+        ]
+        try:
+            for pat in patterns:
+                if any(deriv.glob(pat)):
+                    return True
+        except Exception:
+            pass
         return False

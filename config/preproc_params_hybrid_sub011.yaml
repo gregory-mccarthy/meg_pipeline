@@ -1,0 +1,128 @@
+# ============================================================
+# MEG/EEG Preprocessing Configuration — Hybrid (HPC + Local)
+# v26+ schema with Milgram paths (sub-011)
+# ============================================================
+
+# ---------------- BIDS DATASET IDENTIFIERS ------------------
+subject: "011"
+session: "01"
+task: "rest"
+run: "01"
+
+# Local working directory for temporary files and (optionally) a local mirror
+bids_root: "/Users/gm33/data/epi"
+
+# ---------------- HYBRID / REMOTE I/O -----------------------
+remote_io:
+  enabled: true
+  hpc_host: "transfer-milgram.ycrc.yale.edu"
+  hpc_user: "gm33"
+  remote_bids_root: "/gpfs/milgram/pi/nobre/meg_shared/epilepsy/epi"
+  local_temp_dir: "./temp"
+
+# ---------------- CALIBRATION (tSSS) ------------------------
+# Use absolute paths or repo-relative (e.g., cals/sss_cal_factory_20230619.dat)
+calibration_file: "/Users/gm33/data/cals/sss_cal_factory_20230619.dat"
+cross_talk_file: "/Users/gm33/data/cals/ct_sparse_triux2.fif"
+
+# ---------------- BASIC SIGNAL PROCESSING -------------------
+line_freq: 60.0
+stim_include_mask: 0xFFFF
+head_position_origin: null      # e.g., [0.0, 0.0, 0.04] or null
+
+head_movement:
+  enabled: true
+
+# ---------------- TRIGGER HANDLING ---------------------------
+triggers:
+  stim_channel: "STI101"
+  mask: "0xFFFF"
+  max_settle_ms: 6.0
+  refractory_ms: 20.0
+  auto_mask_stuck_bits: false
+  stuck_high_frac: 0.98
+  stuck_low_frac: 0.02
+
+# ---------------- EEG MONTAGE -------------------------------
+eeg_handling:
+  montage: "/Users/gm33/data/montage/EasyCap_53.sfp"
+
+# ---------------- INTERACTIVE CONTROLS ----------------------
+interactive_bad_channels: true
+interactive_ica: true
+
+# ---------------- MANUAL OVERRIDES --------------------------
+manual_bad_channels: []
+ica_exclude_eeg: []
+ica_exclude_meg: []
+
+# ---------------- AUTOREJECT (MEG/EEG) ----------------------
+autoreject:
+  enabled: true
+  which_types: [mag, grad]        # add 'eeg' if desired
+  filter:
+    highpass: 1.0
+    lowpass: 40.0
+    resample_hz: 100
+  epoch:
+    duration: 2.0
+    tmin: 0.0
+    tmax: 2.0
+  cv_folds: 5
+  thresh_method: "random_search"
+  n_interpolate: [0]
+  verbose: true
+  consensus_thresh: 0.3
+  global_epoch_thresh: 0.5
+
+# ---------------- ICA PREPROCESSING -------------------------
+ica_preprocessing:
+  eeg:
+    highpass: 1.0
+    lowpass: 40.0
+    resample_hz: 100
+    max_ica_duration_sec: 1800
+    interactive: true
+    random_state: 97
+  meg:
+    highpass: 1.0
+    lowpass: 40.0
+    resample_hz: 100
+    max_ica_duration_sec: 1800
+    interactive: true
+    random_state: 97
+
+# ---------------- FINAL OUTPUT FILTER -----------------------
+final_filter:
+  highpass: null
+  lowpass: 55.0
+  resample_hz: null
+  drop_channel_types:
+    - hpi
+    - hlc
+    - coil
+
+# ---------------- CHECKPOINT / RESUME -----------------------
+checkpoint:
+  enabled: true
+  exit_after_checkpoint: false
+  derivatives_root: derivatives
+  pipeline_name: preprocessing
+  atomic_writes: true
+  allow_resume_with_different_yaml: true
+  validate_checkpoint_integrity: true
+  backup_before_overwrite: false
+  max_checkpoint_age_hours: 168
+
+# ---------------- REPRODUCIBILITY ---------------------------
+repro:
+  random_state_global: 42
+  record_environment: true
+
+# ---------------- METADATA FIXES ----------------------------
+metadata_fixes:
+  fix_non_eeg_channels: {}
+  fix_generic: {}
+  expert_patch: |
+    # Optional expert Python hook.
+    # print("Expert patch active for sub-011.")

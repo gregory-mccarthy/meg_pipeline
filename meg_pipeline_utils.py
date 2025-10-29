@@ -28,8 +28,8 @@ except ImportError:
     import yaml
     _yaml_mode = 'pyyaml'
 
-# (If needed by main)
-from bids_io_utils_v2 import (
+# this re-export is required for main
+from bids_io_utils import (
     fetch_bids_data_and_sidecars,
     push_bids_derivatives_rsync,
     detect_environment,
@@ -583,10 +583,15 @@ def load_raw_data(cfg: dict) -> mne.io.Raw:  # CHANGED: config -> cfg
     logger.info(f"Loading raw data: {raw_file}")
     return mne.io.read_raw_fif(raw_file, preload=True)
 
-def prepare_eeg_channels(raw: mne.io.Raw, montage_path: Optional[str], logger: Optional[logging.Logger] = None) -> Dict[str, Any]:
+from pathlib import Path
+from typing import Optional, Dict, Any
+import mne, logging
+
+def prepare_eeg_channels(raw: mne.io.Raw,
+                         montage_path: Optional[str | Path],
+                         logger: Optional[logging.Logger] = None) -> Dict[str, Any]:
     eeg_picks = mne.pick_types(raw.info, eeg=True, meg=False)
-    ch_locs = []
-    good_chs, bad_chs = [], []
+    ch_locs, good_chs, bad_chs = [], [], []
 
     for idx in eeg_picks:
         pos = raw.info['chs'][idx]['loc'][:3]
@@ -596,15 +601,21 @@ def prepare_eeg_channels(raw: mne.io.Raw, montage_path: Optional[str], logger: O
         else:
             bad_chs.append(raw.ch_names[idx])
 
-    status = {
+    status: Dict[str, Any] = {
         "n_eeg_channels": len(eeg_picks),
         "n_digitized_eeg": len(good_chs),
         "digitized_used": False,
         "montage_assigned": False,
         "eeg_channel_renaming": {},
         "dropped_channels": [],
-        "log_message": None
+        "log_message": None,
     }
+
+    # Normalize montage path to Path (or None)
+    mpath: Optional[Path] = None
+    if montage_path:
+        mpath = Path(montage_path)
+    ext = (mpath.suffix.lower() if mpath else "")
 
     if len(good_chs) > 0:
         if bad_chs:
@@ -612,45 +623,56 @@ def prepare_eeg_channels(raw: mne.io.Raw, montage_path: Optional[str], logger: O
             if logger:
                 logger.info(f"Dropped EEG channels with (0,0,0) location: {bad_chs}")
             status["dropped_channels"] = bad_chs
+
         if logger:
             logger.info(f"Retained EEG channels with digitized locations: {good_chs}")
+
         status["n_eeg_channels"] = len(good_chs)
         status["n_digitized_eeg"] = len(good_chs)
         status["digitized_used"] = True
 
-        if montage_path:
-            if montage_path.endswith(('.sfp', '.elc', '.csv')):
-                montage = mne.channels.read_custom_montage(montage_path)
+        if mpath:
+            # Custom file vs standard montage name
+            if ext in ('.sfp', '.elc', '.csv', '.tsv'):
+                montage = mne.channels.read_custom_montage(str(mpath))
             else:
-                montage = mne.channels.make_standard_montage(montage_path)
+                montage = mne.channels.make_standard_montage(mpath.as_posix())
+
+            # Align names conservatively
             eeg_picks = mne.pick_types(raw.info, eeg=True, meg=False)
             raw_names = [raw.ch_names[i] for i in eeg_picks]
-            montage_names = montage.ch_names
+            montage_names = list(montage.ch_names)
             n_rename = min(len(raw_names), len(montage_names))
             rename_map = {raw_names[i]: montage_names[i] for i in range(n_rename)}
+            if rename_map:
+                raw.rename_channels(rename_map)
+                if logger:
+                    logger.info(f"Renamed EEG channels: {rename_map}")
+                status["eeg_channel_renaming"] = rename_map
+
+    elif mpath:
+        # No digitized EEG; apply montage to set positions (and optionally names)
+        if ext in ('.sfp', '.elc', '.csv', '.tsv'):
+            montage = mne.channels.read_custom_montage(str(mpath))
+        else:
+            montage = mne.channels.make_standard_montage(mpath.as_posix())
+
+        raw.set_montage(montage, on_missing='warn')
+        status["montage_assigned"] = True
+        if logger:
+            logger.info(f"Assigned montage {mpath} to EEG channels (names and positions).")
+
+        # Optional: align names after setting montage
+        eeg_picks = mne.pick_types(raw.info, eeg=True, meg=False)
+        raw_names = [raw.ch_names[i] for i in eeg_picks]
+        montage_names = list(montage.ch_names)
+        n_rename = min(len(raw_names), len(montage_names))
+        rename_map = {raw_names[i]: montage_names[i] for i in range(n_rename)}
+        if rename_map:
             raw.rename_channels(rename_map)
             if logger:
                 logger.info(f"Renamed EEG channels: {rename_map}")
             status["eeg_channel_renaming"] = rename_map
-
-    elif montage_path:
-        if montage_path.endswith(('.sfp', '.elc', '.csv')):
-            montage = mne.channels.read_custom_montage(montage_path)
-        else:
-            montage = mne.channels.make_standard_montage(montage_path)
-        raw.set_montage(montage, on_missing='warn')
-        if logger:
-            logger.info(f"Assigned montage {montage_path} to EEG channels (names and positions).")
-        eeg_picks = mne.pick_types(raw.info, eeg=True, meg=False)
-        raw_names = [raw.ch_names[i] for i in eeg_picks]
-        montage_names = montage.ch_names
-        n_rename = min(len(raw_names), len(montage_names))
-        rename_map = {raw_names[i]: montage_names[i] for i in range(n_rename)}
-        raw.rename_channels(rename_map)
-        if logger:
-            logger.info(f"Renamed EEG channels: {rename_map}")
-        status["eeg_channel_renaming"] = rename_map
-        status["montage_assigned"] = True
 
     else:
         if len(eeg_picks) > 0:
@@ -659,7 +681,8 @@ def prepare_eeg_channels(raw: mne.io.Raw, montage_path: Optional[str], logger: O
             if logger:
                 logger.warning("No EEG spatial info or montage provided — all EEG channels dropped.")
             status["dropped_channels"] = drop_names
-            status["log_message"] = "No EEG spatial info or montage. All EEG channels dropped. Treated as no EEG recorded."
+            status["log_message"] = ("No EEG spatial info or montage. All EEG channels dropped. "
+                                     "Treated as no EEG recorded.")
         status["n_eeg_channels"] = 0
         status["n_digitized_eeg"] = 0
         status["digitized_used"] = False
