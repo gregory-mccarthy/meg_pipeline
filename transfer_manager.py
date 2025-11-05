@@ -1,25 +1,26 @@
 #!/usr/bin/env python3
 """
-transfer_manager_v3.py
+transfer_manager_v4.py
 
-HybridTransferManager (v3): class-based API that keeps the original v1 surface
-while incorporating v2 improvements and recent fixes:
+HybridTransferManager (v4): drop-in upgrade of v3 with canonical entity handling.
 
+What’s new vs v3 (no API removals):
+- Canonicalizes BIDS entities (sub/ses/run) using bids_io_utils_v3 helpers.
+  * Accepts inputs like subject="12", session="1", run="1" but emits/uses
+    sub-012/ses-01/run-01 in paths and patterns.
+- Include patterns remain tolerant (match split-1 and split-01, meg-1, etc.).
+- All public methods, args, and behavior from v3 are preserved.
+
+Still the same:
 - Single-rsync philosophy to minimize Duo/TFA prompts.
 - Robust include patterns for both BIDS split files (*_split-*_meg.fif)
   and legacy MEGIN parts (*_meg.fif, *_meg-*.fif).
-- Optional SSH multiplexing (ControlMaster) to reuse one authenticated session.
-- Functional parity with prior versions:
+- Optional SSH multiplexing (ControlMaster).
+- Functional parity:
     - fetch_all_bids_data(...) -> (local_bids_root:str, checkpoint_exists:bool)
     - push_results(...): push derivatives (and optionally raw sidecar updates)
 - Preflight probe via remote_meg_exists(...)
-- Dry-run and verbose flags for safety and logging.
-
-Fixes relative to earlier drafts:
-- Uses legacy-safe rsync flags (--stats --progress -v) instead of --info=...
-- SIDECARES ARE TASK/RUN-SCOPED so we do not pull other tasks.
-- Correct filename stem (sub-XXX[_ses-YYY] with underscores, not slashes).
-- Defensive guards to avoid None / empty include lists.
+- Dry-run / verbose / delete flags carry through.
 """
 
 from __future__ import annotations
@@ -31,6 +32,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+# NEW: canonical entity helpers (tolerant on input, strict on emit)
+from bids_io_utils import norm_subject, norm_session, norm_run
 
 def _expand(p: os.PathLike | str) -> Path:
     return Path(p).expanduser().resolve()
@@ -88,7 +91,7 @@ class SSHOptions:
 
 class HybridTransferManager:
     """
-    Class wrapper matching the original v1 surface while using improved v2 logic.
+    Class wrapper matching the original v1 surface while using improved v2/v3 logic.
 
     Typical use:
         tm = HybridTransferManager(hpc_host, hpc_user, local_temp_dir)
@@ -139,19 +142,24 @@ class HybridTransferManager:
         self.ssh.open_master()
         remote_root = _expand(remote_bids_root)
 
-        # Directory vs filename stems (slash vs underscore)
-        base_dir = f"sub-{subject}" + (f"/ses-{session}" if session and str(session).strip() else "")
-        base_file = f"sub-{subject}" + (f"_ses-{session}" if session and str(session).strip() else "")
+        # Canonicalize entities (tolerant on input)
+        c_sub = norm_subject(subject)
+        c_ses = norm_session(session)
+        c_run = norm_run(run)
+
+        # Directory vs filename stems (slash vs underscore), now canonical
+        base_dir = f"sub-{c_sub}" + (f"/ses-{c_ses}" if c_ses else "")
+        base_file = f"sub-{c_sub}" + (f"_ses-{c_ses}" if c_ses else "")
         remote_meg_dir = remote_root / base_dir / "meg"
         local_meg_dir = self.local_root / base_dir / "meg"
         local_meg_dir.mkdir(parents=True, exist_ok=True)
 
         if not task or not str(task).strip():
             raise ValueError("Explicit task required, e.g., task='rest'.")
-        if not run or not str(run).strip():
+        if not c_run or not str(c_run).strip():
             raise ValueError("Explicit run required, e.g., run='01'.")
 
-        stem = f"{base_file}_task-{task}_run-{run}"
+        stem = f"{base_file}_task-{task}_run-{c_run}"
 
         # Minimal include set at the MEG-dir root
         includes: List[str] = [
@@ -195,7 +203,7 @@ class HybridTransferManager:
                 f"Present files:\n{present if present else '  (none)'}"
             )
 
-        ckpt = self._detect_checkpoint(self.local_root, subject, session)
+        ckpt = self._detect_checkpoint(self.local_root, c_sub, c_ses)
         return (str(self.local_root), ckpt)
 
     def push_results(
@@ -320,17 +328,21 @@ class HybridTransferManager:
 
     @staticmethod
     def _entity_prefix_dir(subject: str, session: Optional[str]) -> str:
-        """Directory prefix: 'sub-XXX[/ses-YYY]' (with slash)."""
-        if session and str(session).strip():
-            return f"sub-{subject}/ses-{session}"
-        return f"sub-{subject}"
+        """Directory prefix: 'sub-XXX[/ses-YY]' (with slash), canonicalized."""
+        s = norm_subject(subject)
+        se = norm_session(session)
+        if se:
+            return f"sub-{s}/ses-{se}"
+        return f"sub-{s}"
 
     @staticmethod
     def _entity_prefix_file(subject: str, session: Optional[str]) -> str:
-        """Filename prefix: 'sub-XXX[_ses-YYY]' (with underscore)."""
-        if session and str(session).strip():
-            return f"sub-{subject}_ses-{session}"
-        return f"sub-{subject}"
+        """Filename prefix: 'sub-XXX[_ses-YY]' (with underscore), canonicalized."""
+        s = norm_subject(subject)
+        se = norm_session(session)
+        if se:
+            return f"sub-{s}_ses-{se}"
+        return f"sub-{s}"
 
     def _build_includes(
         self,
@@ -362,7 +374,10 @@ class HybridTransferManager:
         # FIF patterns (supporting both legacy and BIDS split style)
         if fif_files:
             task_pat = f"task-{task}" if (task and str(task).strip()) else "task-*"
-            run_pat  = f"run-{run}"   if (run  and str(run).strip())  else "run-*"
+            # canonicalize run if provided; otherwise keep wildcard
+            r = norm_run(run) if (run and str(run).strip()) else None
+            run_pat = f"run-{r}" if r else "run-*"
+
             stem = f"{base_fname}_{task_pat}_{run_pat}"
             patterns += [
                 f"{meg_dir}/{stem}_meg.fif",
@@ -373,7 +388,8 @@ class HybridTransferManager:
         # Sidecars commonly needed for MEG processing (TASK/RUN scoped)
         if raw_sidecars:
             task_pat = f"task-{task}" if (task and str(task).strip()) else "task-*"
-            run_pat  = f"run-{run}"   if (run  and str(run).strip())  else "run-*"
+            r = norm_run(run) if (run and str(run).strip()) else None
+            run_pat = f"run-{r}" if r else "run-*"
             stem = f"{base_fname}_{task_pat}_{run_pat}"
 
             # Per-recording sidecars
@@ -389,13 +405,14 @@ class HybridTransferManager:
 
             # Session-level coordsystem, narrowly scoped to THIS session
             patterns += [f"{meg_dir}/{base_fname}_coordsystem.json"]
-            if session and str(session).strip():
-                patterns += [f"{meg_dir}/{base_fname}_ses-{session}_coordsystem.json"]
+            se = norm_session(session)
+            if se:
+                patterns += [f"{meg_dir}/{base_fname}_ses-{se}_coordsystem.json"]
 
         return patterns
 
     def _build_derivatives_includes(self, subject: str, session: Optional[str]) -> List[str]:
-        base_dir = self._entity_prefix_dir(subject, session)    # 'sub-XXX[/ses-YYY]'
+        base_dir = self._entity_prefix_dir(subject, session)  # 'sub-XXX[/ses-YY]' canonicalized
         deriv = "derivatives"
         # Allow traversal into derivatives tree, but limit to sub[/ses] subtree
         return [

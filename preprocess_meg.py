@@ -40,48 +40,21 @@ import logging
 from pathlib import Path
 from datetime import datetime, timezone
 
-import mne
 import json
 import numpy as np
-import matplotlib
+import matplotlib  # safe to import; do NOT import pyplot yet
 
-import bids_io_utils as utils
+# Use distinct aliases (no shadowing)
+#import bids_io_utils_v2 as bdu   # BIDS/data utilities
 
-#from bids_io_utils_v2 import (
-#    fetch_bids_data_and_sidecars,
-#    push_bids_derivatives_rsync,
-#    detect_environment,
-#    write_bids_robust,
-#    read_raw_bids_robust,
-#    get_all_bids_split_files,
-#)
+import meg_pipeline_utils as utils  # your helper library with setup_matplotlib
 
-def _in_slurm() -> bool:
-    return any(k in os.environ for k in ("SLURM_JOB_ID", "SLURM_JOB_NAME", "SLURM_SUBMIT_DIR"))
+import mne  # OK; avoid mne.viz until after backend is chosen
 
-
-def _has_display() -> bool:
-    if sys.platform.startswith("darwin"):
-        return True
-    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
-
-
-_override = os.environ.get("MPLBACKEND_OVERRIDE") or os.environ.get("MPLBACKEND")
-
-if _override:
-    matplotlib.use(_override, force=True)
-elif _in_slurm() or not _has_display():
-    matplotlib.use("Agg", force=True)
-else:
-    matplotlib.use("QtAgg", force=True)
-
+# --- remove the old local backend logic (_in_slurm/_has_display/matplotlib.use(...)) ---
+# We'll call mutils.setup_matplotlib(stage) later, once we know the stage.
 try:
-    import meg_pipeline_utils_v5 as utils
-except ImportError:
-    import meg_pipeline_utils as utils
-
-try:
-    from transfer_manager_v3 import HybridTransferManager
+    from transfer_manager import HybridTransferManager
 except ImportError:
     HybridTransferManager = None
 
@@ -1080,20 +1053,32 @@ def run_pipeline(yaml_path: str, force_stage: str = None):
 
     p, hybrid_used, checkpoint_present, local_bids_root, remote_bids_root = maybe_hybrid_prefetch(p0)
 
+    # Decide stage and set plotting backend accordingly
     stage, checkpoint_path = detect_pipeline_stage(yaml_path, p, force_stage)
     logger.info(f"Running pipeline in {stage.upper()} mode")
+    # Stage-aware backend (Stage 1 → Agg; Stage 2 → QtAgg if display+Qt, else Agg)
+    try:
+        utils.setup_matplotlib(stage)
+    except AttributeError:
+        pass  # older utils without setup_matplotlib()
 
     if stage == "stage1":
         status, _ = run_stage1_pipeline(yaml_path, p)
         if status == 'exit':
-            logger.info("Stage 1 completed - exiting as requested");
+            logger.info("Stage 1 completed - exiting as requested")
             sys.exit(0)
         elif status == 'continue':
+            # Re-detect and switch to Stage 2
             stage2, checkpoint_path = detect_pipeline_stage(yaml_path, p, None)
             if stage2 != "stage2" or checkpoint_path is None:
-                logger.error("Expected Stage 2 after Stage 1, but no checkpoint found");
+                logger.error("Expected Stage 2 after Stage 1, but no checkpoint found")
                 sys.exit(1)
             stage = "stage2"
+            # Switch backend for Stage 2 before any interactive viz
+            try:
+                utils.setup_matplotlib(stage)
+            except AttributeError:
+                pass
 
     if stage == "stage2":
         run_stage2_pipeline(yaml_path, p, checkpoint_path)
@@ -1104,7 +1089,6 @@ def run_pipeline(yaml_path: str, force_stage: str = None):
 
     logger.error(f"Unknown pipeline stage: {stage}")
     sys.exit(1)
-
 
 def parse_arguments():
     """

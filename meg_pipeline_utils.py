@@ -2,19 +2,76 @@ import os, sys, platform, socket, logging, getpass, gc
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any
-import matplotlib.pyplot as plt
+from collections import Counter
+
+# --- DO NOT import matplotlib.pyplot here ---
+import matplotlib  # backend will be chosen later via select_backend_for_stage()
+
+# --- stage-aware backend selection (Qt6-friendly, env-robust) ---
+def _has_display() -> bool:
+    if sys.platform.startswith("darwin"):
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+def _qt_available() -> bool:
+    for mod in ("PyQt6", "PySide6", "PyQt5", "PySide2"):
+        try:
+            __import__(mod)
+            return True
+        except Exception:
+            pass
+    return False
+
+def select_backend_for_stage(stage: str) -> str:
+    """
+    Robust, cross-platform Matplotlib backend chooser.
+    Stage 1  → 'Agg' (headless PNGs)
+    Stage 2+ → 'QtAgg' if display & Qt available, else 'Agg'
+
+    Precedence:
+      1) MPLBACKEND_OVERRIDE (explicit override)
+      2) Stage policy (ignores inherited MPLBACKEND to avoid OOD/Slurm pollution)
+    Call BEFORE importing matplotlib.pyplot or mne.viz.
+    """
+    override = os.environ.get("MPLBACKEND_OVERRIDE")
+    if override:
+        matplotlib.use(override, force=True)
+        return override
+
+    # ignore inherited backend hints (common source of surprises)
+    os.environ.pop("MPLBACKEND", None)
+
+    s = (stage or "").strip().lower()
+    if s in ("1", "stage1", "s1"):
+        matplotlib.use("Agg", force=True)
+        return "Agg"
+
+    if _has_display() and _qt_available():
+        try:
+            matplotlib.use("QtAgg", force=True)
+            return "QtAgg"
+        except Exception:
+            pass
+
+    matplotlib.use("Agg", force=True)
+    return "Agg"
+
+def setup_matplotlib(stage: str) -> str:
+    """Convenience wrapper to select and report backend."""
+    backend = select_backend_for_stage(stage)
+    logging.getLogger("pipeline").info(f"[viz] matplotlib backend: {backend}")
+    return backend
+
+# --- third-party libs (safe: none of these import pyplot by themselves) ---
 import mne
 from mne.preprocessing import ICA
 from mne_bids import BIDSPath
 from mne.io.constants import FIFF
 from mne.bem import fit_sphere_to_headshape
-
 from scipy.signal import find_peaks
+from scipy.stats import kurtosis
 import numpy as np
 from autoreject import Ransac, AutoReject
-import logging
-from collections import Counter
-from scipy.stats import kurtosis
 
 # Logging and version global
 logger = logging.getLogger("pipeline")
@@ -76,11 +133,16 @@ def log_section(title: str) -> None:
     logger.info("=" * len(banner) + "\n")
 
 def get_runtime_info() -> Dict[str, Any]:
+    import numpy as _np
+    import matplotlib as _mpl
     return {
         "script_version": PIPELINE_VERSION,
         "timestamp": datetime.now().isoformat(),
         "python_version": platform.python_version(),
         "mne_version": mne.__version__,
+        "numpy_version": _np.__version__,
+        "matplotlib_version": _mpl.__version__,
+        "matplotlib_backend": _mpl.get_backend(),
         "platform": platform.platform(),
         "system": platform.system(),
         "release": platform.release(),
@@ -90,13 +152,40 @@ def get_runtime_info() -> Dict[str, Any]:
         "user": getpass.getuser(),
     }
 
-def save_plot(fig, out_dir, fname):
-    """Save a matplotlib figure and close it."""
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, fname)
-    fig.savefig(out_path, bbox_inches='tight')
-    plt.close(fig)
-    return out_path
+def save_plot(fig, out_dir, fname, *, dpi=150, transparent=False, close=True) -> str:
+    """
+    Save a matplotlib Figure without importing pyplot.
+    Safe for Stage 1 (Agg) and Stage 2 (interactive).
+    """
+    from pathlib import Path
+    import sys, gc
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / fname
+
+    # Save via Figure API (no pyplot)
+    fig.savefig(out_path, dpi=dpi, bbox_inches="tight", transparent=transparent)
+
+    if close:
+        # Figure-API cleanup; avoid importing pyplot (keeps backend switchable)
+        try:
+            fig.clf()          # clear artists
+        except Exception:
+            pass
+        try:
+            # If pyplot is already imported elsewhere, close via its API
+            _plt = sys.modules.get("matplotlib.pyplot")
+            if _plt is not None:
+                _plt.close(fig)
+        except Exception:
+            pass
+        try:
+            gc.collect()
+        except Exception:
+            pass
+
+    return str(out_path)
 
 # ========== Workflow Determination ==========
 
@@ -1779,6 +1868,10 @@ def find_bad_channels_autoreject_by_type(
     return detected_bads
 
 def qc_meg_raw(raw: mne.io.Raw, plots_dir: str, hf_band: tuple = (250, 400)):
+    # Local pyplot import so we don't lock the backend at module import time.
+    # Assumes caller has already run setup_matplotlib("stage1"|"stage2").
+
+    import matplotlib.pyplot as plt
     data = raw.get_data()
     rms = np.sqrt((data ** 2).mean(axis=1))
     for typ, label in [("mag", "Magnetometers"), ("grad", "Gradiometers"), ("eeg", "EEG")]:
@@ -1821,6 +1914,9 @@ def plot_head_movement(head_pos_array, plots_dir: str, fname="head_movement_over
     Plot translation (mm) and rotation (deg) over time from head_pos array.
     head_pos_array: N x 10 array as returned by mne.chpi.read_head_pos()
     """
+    # Local pyplot import; backend should already be chosen by setup_matplotlib()
+    import matplotlib.pyplot as plt
+
     if head_pos_array is None or head_pos_array.shape[0] == 0:
         logger.warning("No head position data found to plot head movement.")
         return

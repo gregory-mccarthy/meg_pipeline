@@ -1,0 +1,5 @@
+bids_root: "/Users/gm33/data/fairy"
+subject: "01"
+session: "01"
+task: "faces"
+run: "01"   # (Include only if your visualization code or file names require it)

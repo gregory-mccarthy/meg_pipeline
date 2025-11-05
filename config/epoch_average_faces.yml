@@ -1,0 +1,67 @@
+# ==== BIDS & run list ====
+bids_root: "/Users/gm33/data/fairy"
+
+inputs:
+  - subject: "01"
+    session: "01"      # zero-padded to match ses-01 on disk
+    task: "faces"
+    run: "01"
+
+# Read ONLY the derivative file:
+derivatives_subdir: "derivatives/preprocessing"
+derivatives_desc: "preproc"   # matches _desc-preproc_meg.fif
+
+# === Event source and timing correction ===
+events:
+  source: "annot_timing_stim_codes"
+  base: "rel"
+  tolerance_sec: 0.002
+  regex: "TRIG/(\\d+)"
+  offset_ms: -75          # global offset (negative = shift earlier)
+  verify_against_stim: true
+  notes: "Trigger codes were written 75 ms after true visual onset (per experimenter)."
+
+# ==== Global defaults ====
+stim_channel: "STI101"          # summed trigger channel (used for 'stim' path)
+
+# Default epoch window (override per condition below if desired)
+tmin: -0.1
+tmax: 0.5
+baseline: [null, 0.0]
+
+# Optional filtering / rejection
+use_reject: false
+reject:
+  mag: 4e-12
+  grad: 4000e-13
+  eeg: 100e-6
+
+filter:
+  l_freq: null
+  h_freq: null
+
+# (Optional) add short BAD annotation around each event onset
+artifact_suppression: { window: null }
+
+# ==== Conditions (expression-based) ====
+# - Face identity = bits 1–3 (mask 0x007)
+# - ISI/Context   = bits 4–6 (mask 0x038)
+# - Target flag   = bit 7     (mask 0x040)
+
+conditions:
+  faces_non_target:
+    expr: "((code & 0x38) != 0) & ((code & 0x40) == 0)"
+  faces_target:
+    expr: "((code & 0x40) != 0)"
+
+# Per-condition windows (optional)
+epoch_windows:
+  faces_non_target: { tmin: -0.1, tmax: 0.5 }
+  faces_target:     { tmin: -0.1, tmax: 0.5 }
+
+# ==== Outputs ====
+outputs:
+  save_evokeds: true
+  save_epochs:  true
+  evokeds_subdir: "derivatives/avg"
+  epochs_subdir:  "derivatives/epochs"
