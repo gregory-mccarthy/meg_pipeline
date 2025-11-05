@@ -1,0 +1,211 @@
+# ============================================================
+# MEG/EEG Preprocessing Configuration — Master, Fully Annotated
+# ============================================================
+# How to use:
+#   1) Copy this file and rename per subject/session (e.g., sub-001_ses-01.yaml)
+#   2) Fill in BIDS identifiers and paths under “BIDS DATASET IDENTIFIERS”
+#   3) For LOCAL runs, keep remote_io.enabled: false
+#   4) For HYBRID runs, set remote_io.enabled: true and fill host/paths
+#   5) Most users can keep defaults elsewhere; see inline notes for details
+#
+# Notes on precedence:
+#   - Values here override any “lab_defaults” file if provided.
+#   - Nested blocks can be selectively enabled/disabled with the “enabled” flag.
+#
+# Checkpointing & resumability:
+#   - This pipeline writes intermediate “checkpoint” files that allow clean resume.
+#   - “atomic_writes: true” prevents partial files; on failure a temporary
+#     “emergency_save_XX.fif” may be produced to avoid data loss (safe to remove once
+#     a clean run completes). See “CHECKPOINT AND RESUME SYSTEM” below for options.
+# ============================================================
+
+# ============================================================
+# (Optional) LAB DEFAULT CONFIG INHERITANCE
+# ============================================================
+# If you share site-wide defaults, point to them here. Any keys below override those.
+lab_defaults: /path/to/lab_defaults.yaml
+
+# ------------------------------------------------------------
+# BIDS DATASET IDENTIFIERS (REQUIRED)
+# ------------------------------------------------------------
+# subject/session/task/run drive output file naming and selection of raw data.
+# “run” can be null if your dataset has no run entity.
+subject: "001"                  # string (e.g., "001"); must match BIDS folder/entity
+session: "01"                   # string (e.g., "01"); must match BIDS folder/entity
+task: "faces"                   # string; appears in output filenames
+run: null                       # null or string like "01"
+bids_root: /path/to/bids_root   # absolute path recommended (no shell ~ expansion)
+
+# ------------------------------------------------------------
+# HYBRID / REMOTE I/O (OPTIONAL)
+# ------------------------------------------------------------
+# Enable if you copy raw/derivatives from HPC -> local temp, process locally,
+# then push results back. For local-only processing, keep enabled: false.
+remote_io:
+  enabled: false
+  hpc_host: transfer-milgram.ycrc.yale.edu   # FQDN of HPC transfer host
+  hpc_user: your_netid                       # SSH user on HPC
+  remote_bids_root: /gpfs/.../BIDS/project   # BIDS root on HPC
+  local_temp_dir: ./temp                     # local staging; created if missing
+
+# ------------------------------------------------------------
+# MAXWELL FILTERING (tSSS) CALIBRATION (RECOMMENDED FOR MEG)
+# ------------------------------------------------------------
+# Provide site-appropriate SSS calibration and cross-talk files.
+# Paths may be absolute or repo-relative.
+calibration_file: cals/sss_cal_factory_20230619.dat
+cross_talk_file: cals/ct_sparse_triux2.fif
+
+# ------------------------------------------------------------
+# BASIC SIGNAL PROCESSING / GLOBAL OPTIONS
+# ------------------------------------------------------------
+head_movement:
+  enabled: true           # Track head position if HPI data present; safe on.
+
+line_freq: 60.0           # Mains frequency; 50.0 in many regions outside US.
+stim_include_mask: 0xFFFF # Bitmask applied to STI channel to include bits.
+head_position_origin: null # e.g., [0.0, 0.0, 0.04]; null = let MNE infer.
+
+# ------------------------------------------------------------
+# TRIGGER PARSING (EVENT DETECTION)
+# ------------------------------------------------------------
+# The pipeline extracts events from a digital trigger channel (MEG systems).
+# If your dataset embeds events differently, adjust “stim_channel” and mask logic.
+triggers:
+  stim_channel: "STI101"    # Main digital trigger channel name in raw data.
+  mask: "0xFFFF"            # Keep only these bits (hex string or int).
+  max_settle_ms: 6.0        # Debounce: ignore edges within this window after change.
+  refractory_ms: 20.0       # Refractory period to avoid double-counting.
+  auto_mask_stuck_bits: false # If true, auto-drops bits that look permanently high/low.
+  stuck_high_frac: 0.98     # Heuristics for auto detection (fraction of samples high).
+  stuck_low_frac: 0.02
+
+# ------------------------------------------------------------
+# EEG MONTAGE (IGNORED IF NO EEG IN DATA)
+# ------------------------------------------------------------
+# Provide a standard montage name (e.g., "standard_1020") or a path to a .loc/.elp.
+eeg_handling:
+  montage: null             # null = leave as-is; else "standard_1020" or file path.
+
+# ------------------------------------------------------------
+# INTERACTIVE STEPS
+# ------------------------------------------------------------
+# When true, the pipeline will pause to let the user inspect/fix channels or ICA.
+# Disable for unattended batch processing on known-good data.
+interactive_bad_channels: true
+interactive_ica: true
+
+# ------------------------------------------------------------
+# MANUAL OVERRIDES (OPTIONAL)
+# ------------------------------------------------------------
+# Provide explicit lists for known-bad channels or ICA components to remove/keep.
+manual_bad_channels: []     # e.g., ["MEG1234", "EEG001"]
+ica_exclude_eeg: []         # e.g., [0, 2] to remove EEG ICs
+ica_exclude_meg: []         # e.g., [1, 3] to remove MEG ICs
+
+# ------------------------------------------------------------
+# AUTOREJECT (EPOCH-WISE ARTIFACT DETECTION; OPTIONAL BUT USEFUL)
+# ------------------------------------------------------------
+# If enabled, runs a data-driven threshold search over short epochs to mark/reject.
+# Works best after a light band-pass and (optionally) downsampling for speed.
+autoreject:
+  enabled: true
+  which_types: [mag, grad]   # Any subset of [mag, grad, eeg]; empty = none.
+  filter:
+    highpass: 1.0            # Hz, applied only for AR fitting (not saved to final).
+    lowpass: 40.0            # Hz
+    resample_hz: null        # e.g., 200 for speed; null = no resampling.
+  epoch:
+    duration: 2.0            # seconds per trial (sliding or fixed per design)
+    tmin: 0.0                # epoch window start (sec)
+    tmax: 2.0                # epoch window end (sec)
+  cv_folds: 7
+  thresh_method: "random_search"   # or "bayesian_optimization"
+  n_interpolate: [0]         # try interpolation orders; [0] = reject-only
+  verbose: true
+  consensus_thresh: 0.3      # how strict across channels
+  global_epoch_thresh: 0.5   # reject an epoch if >50% channels bad
+
+# ------------------------------------------------------------
+# ICA PREPROCESSING (SEPARATE SETTINGS FOR EEG/MEG)
+# ------------------------------------------------------------
+# These filters are for *ICA fitting only* to isolate slow drifts & HF noise.
+# Final saved data use “FINAL OUTPUT PROCESSING” below.
+ica_preprocessing:
+  eeg:
+    highpass: 1.0
+    lowpass: 40.0
+    resample_hz: 200         # speed/conditioning; null to keep native
+    max_ica_duration_sec: 1800  # safety cap; long datasets can be truncated
+    interactive: true        # pause for component review if interactive_ica is false
+    random_state: 97
+  meg:
+    highpass: 1.0
+    lowpass: 40.0
+    resample_hz: 200
+    max_ica_duration_sec: 1800
+    interactive: true
+    random_state: 97
+
+# ------------------------------------------------------------
+# FINAL OUTPUT PROCESSING (APPLIED AFTER ARTIFACT HANDLING)
+# ------------------------------------------------------------
+# Keep these null to preserve native bandwidth/sampling in final output.
+final_filter:
+  highpass: null             # e.g., 0.3 for DC-drift control
+  lowpass: null              # e.g., 100 for HF suppression
+  resample_hz: null          # e.g., 600 or 1000 for uniformity across subjects
+  drop_channel_types:        # Channel types to remove from final writeout
+    - hpi                    # head position indicator coils
+    - hlc                    # head localization coils (vendor-specific)
+    - coil                   # auxiliary coil channels
+
+# ------------------------------------------------------------
+# CHECKPOINT AND RESUME SYSTEM
+# ------------------------------------------------------------
+# Produces derivative files under “derivatives_root/pipeline_name/...”
+# You can stop after Stage 1 and resume; the program validates prior outputs.
+checkpoint:
+  enabled: true
+  exit_after_checkpoint: false  # true = run Stage 1 only and exit cleanly
+  derivatives_root: derivatives # relative to bids_root unless absolute
+  pipeline_name: preprocessing  # subfolder within derivatives_root
+  atomic_writes: true           # write to tmp + atomic rename to prevent corruption
+  allow_resume_with_different_yaml: true  # resume even if config changed slightly
+  validate_checkpoint_integrity: true     # verify hashes/shapes before reuse
+  backup_before_overwrite: false          # true = keep .bak of prior checkpoint
+  max_checkpoint_age_hours: 168           # safety for stale intermediates (7 days)
+
+# ------------------------------------------------------------
+# REPRODUCIBILITY
+# ------------------------------------------------------------
+# Record environment info and fix global RNG when possible.
+repro:
+  random_state_global: 42
+  record_environment: true   # saves package versions, OS, etc., into logs
+
+# ------------------------------------------------------------
+# METADATA CORRECTIONS (ADVANCED / OPTIONAL)
+# ------------------------------------------------------------
+# Use these to patch Raw.info or channel metadata when vendor exports are imperfect.
+metadata_fixes:
+  # Map non-EEG channel names/types you want treated as EEG (rare; lab-specific)
+  fix_non_eeg_channels: {}
+  # Arbitrary python code string executed at load-time if you need an expert patch.
+  fix_generic: {}
+  expert_patch: |
+    # Example: print or assert something; runs in pipeline scope.
+    # Remove or keep as no-op. Use sparingly for reproducibility.
+    print("✅ Expert patch executed.")
+
+# ------------------------------------------------------------
+# OPTIONAL FUTURE EXTENSIONS (DISABLED BY DEFAULT)
+# ------------------------------------------------------------
+# Safe placeholders; can be turned on later without breaking older configs.
+auxiliary_logs:
+  enabled: false
+  path: null                 # e.g., /path/to/aux/log.tsv
+
+behavioral_triggers:
+  enabled: false
+  source: null               # e.g., a TSV file with onsets/labels to merge as events
