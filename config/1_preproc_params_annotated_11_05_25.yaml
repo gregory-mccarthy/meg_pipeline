@@ -37,6 +37,17 @@ run: null                       # null or string like "01"
 bids_root: /path/to/bids_root   # absolute path recommended (no shell ~ expansion)
 
 # ------------------------------------------------------------
+# (OPTIONAL) SUB-SEGMENT TIME WINDOW FOR LARGE RECORDINGS
+# ------------------------------------------------------------
+# Process only a portion of very long Raw files without loading the full duration.
+# - If this entire block is omitted, the pipeline analyzes the full recording.
+# - Accepts "hh:mm:ss", "mm:ss", an integer/float in seconds, or null.
+# - Use null for start to begin at 0 s; use null for end to continue to file end.
+time_window:
+  start: null   # e.g., "20:00" (20 min), 1200, or null to start at 0 s
+  end:   null   # e.g., "30:00" (30 min), 1800, or null to go to recording end
+
+# ------------------------------------------------------------
 # HYBRID / REMOTE I/O (OPTIONAL)
 # ------------------------------------------------------------
 # Enable if you copy raw/derivatives from HPC -> local temp, process locally,

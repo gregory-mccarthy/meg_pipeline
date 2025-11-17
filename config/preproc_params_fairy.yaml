@@ -1,0 +1,171 @@
+# ============================================================
+# MEG/EEG Preprocessing Configuration - Hybrid Processing Mode
+# ============================================================
+# Hybrid workflow: fetch raw data from HPC, process locally,
+# push derivatives back. Two-stage pipeline with automated
+# artifact rejection followed by interactive ICA review.
+# ============================================================
+
+# ============================================================
+# BIDS DATASET IDENTIFIERS
+# ============================================================
+
+
+# ============================================================
+# HYBRID PROCESSING I/O
+# ============================================================
+# Configuration for distributed processing between local machine
+# and HPC cluster. Pipeline rewrites bids_root to local_temp_dir
+# at runtime for local processing.
+# ============================================================
+remote_io:
+  enabled: true
+  hpc_host: transfer-milgram.ycrc.yale.edu
+  hpc_user: gm33
+  remote_bids_root: /gpfs/milgram/pi/nobre/meg_shared/fairy/bids
+  local_temp_dir: ./temp
+
+# ============================================================
+# MAXWELL FILTERING (tSSS) CALIBRATION
+# ============================================================
+# Temporal Signal Space Separation calibration files.
+# Paths resolved relative to repository root if not absolute.
+# ============================================================
+calibration_file: cals/sss_cal_factory_20230619.dat
+cross_talk_file: cals/ct_sparse_triux2.fif
+
+# ============================================================
+# BASIC SIGNAL PROCESSING
+# ============================================================
+head_movement:
+  enabled: true
+
+line_freq: 60.0
+stim_include_mask: 0xFFFF
+head_position_origin: null
+
+# ============================================================
+# EEG MONTAGE CONFIGURATION
+# ============================================================
+eeg_handling:
+  montage: montage/megin_64chan_eeg_montage.sfp
+
+# ============================================================
+# INTERACTIVE PROCESSING CONTROLS
+# ============================================================
+interactive_bad_channels: true
+interactive_ica: true
+
+# ============================================================
+# MANUAL OVERRIDES
+# ============================================================
+manual_bad_channels: []
+ica_exclude_eeg: []
+ica_exclude_meg: []
+
+# ============================================================
+# AUTOREJECT ARTIFACT DETECTION
+# ============================================================
+# Automated bad channel and epoch detection using cross-validation
+# and consensus thresholding. Operates on filtered and epoched data.
+# ============================================================
+autoreject:
+  enabled: true
+  which_types: [eeg, mag]
+
+  # Preprocessing parameters for autoreject analysis
+  filter:
+    highpass: 1.0
+    lowpass: 40.0
+    resample_hz: null
+
+  epoch:
+    duration: 2.0
+    tmin: 0.0
+    tmax: 2.0
+
+  # Algorithm parameters
+  cv_folds: 7
+  thresh_method: 'random_search'
+  #thresh_method: 'bayesian_optimization'
+  n_interpolate: [0]
+  verbose: true
+
+  # Detection thresholds
+  consensus_thresh: 0.3
+  global_epoch_thresh: 0.5
+
+# ============================================================
+# INDEPENDENT COMPONENT ANALYSIS (ICA)
+# ============================================================
+# Separate preprocessing pipelines for EEG and MEG channels
+# prior to ICA decomposition. Duration limits prevent excessive
+# computation on long recordings.
+# ============================================================
+ica_preprocessing:
+  eeg:
+    highpass: 1.0
+    lowpass: 40.0
+    resample_hz: 200
+    max_ica_duration_sec: 1800
+    interactive: true
+    random_state: 97
+  meg:
+    highpass: 1.0
+    lowpass: 40.0
+    resample_hz: 200
+    max_ica_duration_sec: 1800
+    interactive: true
+    random_state: 97
+
+# ============================================================
+# FINAL OUTPUT PROCESSING
+# ============================================================
+# Applied after artifact removal and ICA cleaning.
+# Channel type dropping occurs before file saving.
+# ============================================================
+final_filter:
+  highpass: null
+  lowpass: null
+  resample_hz: null
+  drop_channel_types:
+    - hpi
+    - hlc
+    - coil
+
+# ============================================================
+# CHECKPOINT AND RESUME SYSTEM
+# ============================================================
+# Stage 1 outputs to derivatives/ with manifest for Stage 2 resume.
+# Supports hybrid workflows with different YAML configurations
+# between stages.
+# ============================================================
+checkpoint:
+  enabled: true
+  exit_after_checkpoint: false
+  derivatives_root: derivatives
+  pipeline_name: preprocessing
+  atomic_writes: true
+  allow_resume_with_different_yaml: true
+  validate_checkpoint_integrity: true
+  backup_before_overwrite: false
+  max_checkpoint_age_hours: 168
+
+# ============================================================
+# REPRODUCIBILITY CONTROLS
+# ============================================================
+repro:
+  random_state_global: 42
+  record_environment: true
+
+# ============================================================
+# METADATA CORRECTIONS
+# ============================================================
+# Applied during data loading to fix channel information
+# and other dataset-specific issues.
+# ============================================================
+metadata_fixes:
+  fix_non_eeg_channels: {}
+  fix_generic: {}
+  expert_patch: |
+    print("✅ Expert patch executed successfully.")

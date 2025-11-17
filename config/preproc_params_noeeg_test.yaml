@@ -1,0 +1,17 @@
+# ============================================================
+# MEG/EEG Preprocessing Configuration - Local Processing Mode
+# ============================================================
+# Local workflow: process data directly from local BIDS directory
+# Two-stage pipeline with automated artifact rejection followed
+# by interactive ICA review.
+# ============================================================
+
+lab_defaults: /Users/gm33/PythonProject/lab_defaults.yaml
+
+# BIDS Dataset
+subject: "015"
+session: "01"
+run: "01"
+task: "mns"
+bids_root: /Users/gm33/PythonProject/temp/bids
+

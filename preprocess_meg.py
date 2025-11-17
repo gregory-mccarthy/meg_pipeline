@@ -47,9 +47,26 @@ import matplotlib  # safe to import; do NOT import pyplot yet
 # Use distinct aliases (no shadowing)
 #import bids_io_utils_v2 as bdu   # BIDS/data utilities
 
-import meg_pipeline_utils as utils  # your helper library with setup_matplotlib
+import meg_pipeline_utils as utils
+
+from headpos_utils import (
+    prepare_headpos_from_config,
+    compute_head_movement_stats,
+    compute_head_pos_from_raw,
+    plot_head_movement,
+    read_head_pos_safe,
+    get_bids_headpos_path,
+)
+
+from bids_io_utils import parse_time_window
 
 import mne  # OK; avoid mne.viz until after backend is chosen
+
+mne.set_log_level('WARNING')
+#mne.set_log_level('ERROR')
+#mne.set_log_level('CRITICAL')
+#mne.set_log_level('INFO')
+#mne.set_log_level('DEBUG')
 
 # --- remove the old local backend logic (_in_slurm/_has_display/matplotlib.use(...)) ---
 # We'll call mutils.setup_matplotlib(stage) later, once we know the stage.
@@ -62,6 +79,24 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("pipeline")
 PIPELINE_VERSION = "1.2"
 CHECKPOINT_VERSION = "1.0"
+
+import numpy as np
+
+def log_meg_stats(raw, tag, logger, tmin=None, tmax=None):
+    seg = raw.copy().crop(
+        tmin=raw.times[0] if tmin is None else tmin,
+        tmax=min(raw.times[-1], (tmin or raw.times[0]) + 10.0) if tmax is None else tmax,
+    )
+    picks = mne.pick_types(seg.info, meg=True)
+    data = seg.get_data(picks=picks)  # shape (n_meg, n_times)
+
+    per_chan_max = np.max(np.abs(data), axis=1)
+    logger.info(
+        f"[{tag}] MEG | "
+        f"median(|max|)={np.median(per_chan_max):.3e}, "
+        f"95th={np.percentile(per_chan_max, 95):.3e}, "
+        f"max={per_chan_max.max():.3e}"
+    )
 
 
 def detect_pipeline_stage(yaml_path: str, p: dict, force_stage: str = None):
@@ -226,117 +261,415 @@ def run_stage1_pipeline(yaml_path: str, p: dict):
     bids_path = utils.BIDSPath(subject=subject, session=session, task=task, run=run,
                                datatype="meg", root=bids_root)
     raw = utils.read_raw_bids_robust(bids_path)
-    raw_fif_path = raw.filenames[0]
-    meg_dir = os.path.dirname(raw_fif_path)
+    # Optional sub-segment cropping
+    try:
+        tw = parse_time_window(p)  # p is your loaded config dict
+    except Exception as _e:
+        logger.error(f"Invalid time_window in YAML: {_e}");
+        sys.exit(1)
+    if tw:
+        tmin, tmax = tw
+        raw.crop(tmin=tmin, tmax=tmax)  # lazy; still not preloaded
+        logger.info(
+            f"Cropped recording to window: start={tmin if tmin is not None else 0.0:.3f}s, "
+            f"end={'end' if tmax is None else f'{tmax:.3f}s'}; duration={raw.times[-1]:.3f}s"
+        )
+        log_meg_stats(raw, "After crop", logger)
+        # ---------- BEGIN: Head-position handling via headpos_utils ----------
 
-    original_recording_info = {
-        "raw_file_path": raw_fif_path,
-        "original_sfreq": float(raw.info['sfreq']),
-        "original_duration_sec": float(raw.times[-1]),
-        "n_channels_total": len(raw.ch_names),
-        "channel_types": {ch_type: len(mne.pick_types(raw.info, **{ch_type: True}))
-                          for ch_type in ['meg', 'eeg', 'eog', 'ecg', 'stim', 'misc']},
-        "measurement_date": raw.info.get('meas_date').isoformat() if raw.info.get('meas_date') else None,
-        "line_frequency": float(raw.info.get('line_freq', 60.0))
-    }
+        raw_fif_path = raw.filenames[0]
+        meg_dir = os.path.dirname(raw_fif_path)
 
-    expected_pos = utils.get_bids_headpos_path(subject, session, task, run, meg_dir)
-    pos_file_requested = expected_pos if os.path.exists(expected_pos) else None
-    logger.info(f"Head position file: {pos_file_requested if pos_file_requested else 'Will compute if needed'}")
+        original_recording_info = {
+            "raw_file_path": raw_fif_path,
+            "original_sfreq": float(raw.info["sfreq"]),
+            "original_duration_sec": float(raw.times[-1]),
+            "n_channels_total": len(raw.ch_names),
+            "channel_types": {
+                ch_type: len(mne.pick_types(raw.info, **{ch_type: True}))
+                for ch_type in ["meg", "eeg", "eog", "ecg", "stim", "misc"]
+            },
+            "measurement_date": (
+                raw.info.get("meas_date").isoformat()
+                if raw.info.get("meas_date") else None
+            ),
+            "line_frequency": float(raw.info.get("line_freq", 60.0)),
+        }
 
-    utils.log_section("3. Compute or Load Head Position")
-    head_movement_cfg = p.get("head_movement", {})
-    movement_enabled = head_movement_cfg.get("enabled", False)
-    head_pos_array = None
-    head_pos_path = None
+        # Build derivative paths FIRST (for later saving/plots)
+        bids_path_deriv = bids_path.copy().update(
+            root=Path(bids_root) / "derivatives" / p.get("checkpoint", {}).get("pipeline_name", "preprocessing"),
+            suffix="meg",
+            description="preproc",
+            extension=".fif",
+        )
+        out_fif = str(bids_path_deriv.fpath)
+        os.makedirs(os.path.dirname(out_fif), exist_ok=True)
 
-    if movement_enabled:
-        head_pos_path = utils.get_head_pos_for_maxwell(raw, pos_file=pos_file_requested,
-                                                       compute_if_missing=True, logger=logger)
-        if head_pos_path and os.path.exists(head_pos_path):
+        plots_dir = os.path.join(os.path.dirname(out_fif), "plots")
+        os.makedirs(plots_dir, exist_ok=True)
+
+        utils.log_section("3. Compute or Load Head Position")
+
+        # Head-position config from YAML
+        hpp_cfg = p.get("head_position_processing", {}) if isinstance(p, dict) else {}
+
+        # Optional: derive a window tag from the global time_window for naming subset .pos
+        tw = parse_time_window(p)
+        tmin, tmax = (tw if tw else (None, None))
+        start_s = 0 if tmin is None else int(tmin)
+        end_s = "end" if tmax is None else int(tmax)
+        subset_tag = hpp_cfg.get("subset_naming", "desc-crop")
+        run_piece = f"_run-{run}" if run else ""
+
+        ck = p.get("checkpoint", {}) if isinstance(p, dict) else {}
+        derivatives_root = ck.get("derivatives_root", "derivatives")
+        pipeline_name = ck.get("pipeline_name", "preprocessing")
+
+        def _save_subset_pos(hp_abs):
+            """Write a window-specific .pos file for this run and return its path."""
+            deriv_dir = (
+                Path(bids_root)
+                / derivatives_root
+                / pipeline_name
+                / f"sub-{subject}"
+                / f"ses-{session}"
+                / "meg"
+            )
+            deriv_dir.mkdir(parents=True, exist_ok=True)
+            subset_fname = (
+                f"sub-{subject}_ses-{session}_task-{task}{run_piece}_"
+                f"{subset_tag}{start_s}-{end_s}_headpos.pos"
+            )
+            subset_path = deriv_dir / subset_fname
+            mne.chpi.write_head_pos(str(subset_path), hp_abs)
+            logger.info(f"Wrote head-position subset to: {subset_path}")
+            return str(subset_path)
+
+        def _load_reference_headpos(ref_run):
+            """Load head_pos array for a reference run (used for source='run' or destination='reference')."""
+            ref_run_str = f"{int(ref_run):02d}" if isinstance(ref_run, (int, np.integer, str)) else str(ref_run)
+            ref_pos_path = get_bids_headpos_path(
+                subject=subject,
+                session=session,
+                task=task,
+                run=ref_run_str,
+                meg_dir=str(
+                    # use the same MEG directory as this run, which is already resolved
+                    Path(bids_root) / f"sub-{subject}" / f"ses-{session}" / "meg"
+                ),
+            )
+            hp = read_head_pos_safe(str(ref_pos_path), logger=logger)
+            return hp
+
+        # ------------------------------------------------------------------
+        # 4–7. EEG setup, metadata repair, pre-Maxwell QC, head position,
+        #      and Maxwell filter (tSSS)
+        #
+        # Responsibilities:
+        #   - Configure EEG channels (montage, renaming, dropping extras)
+        #   - Apply metadata fixes from YAML (channel types, units, etc.)
+        #   - Run pre-Maxwell MEG QC and PSD diagnostics
+        #   - Prepare head-position array and destination from YAML
+        #   - Apply Maxwell filter (tSSS) using:
+        #       * factory calibration & cross-talk
+        #       * optional movement compensation (head_pos)
+        #       * optional headshape-based origin (HEAD frame, meters)
+        #       * optional destination (HEAD frame, meters)
+        #   - Run post-Maxwell QC and log tSSS effectiveness
+        #
+        # YAML controls (head_position_processing block, hpp_cfg):
+        #   - movement_compensation: bool (default True)
+        #   - st_duration: float (default 10.0 s)
+        #   - use_headshape_origin: bool (default True)
+        #   - use_destination: bool (default True)
+        #   - other details for head_pos source, write_subset, etc.
+        #     are handled inside prepare_headpos_from_config().
+        # ------------------------------------------------------------------
+
+        # 4. EEG Channel Setup
+        utils.log_section("4. EEG Channel Setup")
+        eeg_setup_results = utils.prepare_eeg_channels(
+            raw,
+            checked_paths["montage"],
+            logger,
+        )
+
+        # 5. Metadata Repair
+        utils.log_section("5. Metadata Repair")
+        metadata_repair_results = utils.apply_metadata_repairs(
+            raw,
+            p.get("metadata_fixes", {}),
+        )
+
+        # 6. PSD & RMS Diagnostics (Pre-filtering)
+        utils.log_section("6. PSD & RMS Diagnostics (Pre-filtering)")
+        utils.qc_meg_raw(raw, plots_dir)
+        utils.plot_psd_and_peaks(raw, "Raw PSD Before Maxwell", plots_dir)
+
+        # Pre-Maxwell MEG quality metrics (for later comparison)
+        metrics_pre_maxwell = utils.compute_meg_quality_metrics(raw, "pre_maxwell")
+
+        # ---------------- Head position & destination prep ----------------
+        # Head-position configuration is driven by the head_position_processing
+        # section of the YAML (hpp_cfg). The details of:
+        #   - source of head_pos (file / compute / reference / none)
+        #   - absolute vs relative times and cropping to this Raw
+        #   - computation of per-run destination pose
+        # are handled inside prepare_headpos_from_config().
+        #
+        # Restored behavior:
+        #   • If cfg.source == "file" and no file_path is given, we derive the
+        #     expected BIDS sidecar *.pos path for this run. If that file exists,
+        #     it is used.
+        #   • If the file does not exist AND movement_compensation is requested,
+        #     we fall back to computing head_pos from the raw cHPI data.
+        #   • The returned head_pos_abs is in absolute time (seconds since
+        #     recording start), already aligned to the current crop window.
+
+        # Determine requested source and movement policy from YAML
+        source_cfg = (
+            hpp_cfg.get("source", "file")
+            if isinstance(hpp_cfg, dict)
+            else "file"
+        )
+        movement_requested = (
+            bool(hpp_cfg.get("movement_compensation", True))
+            if isinstance(hpp_cfg, dict)
+            else True
+        )
+
+        # Default .pos path: if source is "file" or "run" and no file_path is
+        # given, derive the canonical BIDS headpos sidecar in this run's MEG dir.
+        default_pos_path = None
+        if isinstance(hpp_cfg, dict) and source_cfg in ("file", "run"):
+            if not hpp_cfg.get("file_path"):
+                meg_dir = str(Path(bids_root) / f"sub-{subject}" / f"ses-{session}" / "meg")
+                try:
+                    default_pos_path = get_bids_headpos_path(
+                        subject=subject,
+                        session=session,
+                        task=task,
+                        run=run,
+                        meg_dir=meg_dir,
+                    )
+                    logger.info(f"[headpos] Using default BIDS sidecar path: {default_pos_path}")
+                except Exception as e:
+                    logger.warning(
+                        f"[headpos] Failed to derive default BIDS headpos path: {e}. "
+                        "Will rely on explicit file_path or compute-from-raw."
+                    )
+
+        # First pass: honor the configured source and let prepare_headpos_from_config
+        # do its work. We provide compute_head_pos_from_raw so that source='compute'
+        # can use it.
+        headpos_result = prepare_headpos_from_config(
+            raw=raw,
+            cfg=hpp_cfg if isinstance(hpp_cfg, dict) else {},
+            default_pos_path=default_pos_path,
+            compute_headpos_fn=compute_head_pos_from_raw,
+            load_reference_headpos_fn=_load_reference_headpos,
+            save_subset_fn=_save_subset_pos if isinstance(hpp_cfg, dict) and hpp_cfg.get("write_subset",
+                                                                                         False) else None,
+            logger=logger,
+        )
+
+        head_pos_array = headpos_result.get("head_pos_abs", None)  # absolute time positions (possibly clipped)
+        destination = headpos_result.get("destination", None)  # HEAD-frame 3-vector or None
+        movement_enabled = bool(headpos_result.get("movement_enabled", False))
+        source_used = headpos_result.get("source_used", source_cfg)
+
+        # Fallback: if a file or reference was requested, movement was requested,
+        # but no head_pos was obtained, try computing from raw.
+        if (
+                movement_requested
+                and (head_pos_array is None or len(head_pos_array) == 0)
+                and source_used in ("file", "run")
+        ):
+            logger.warning(
+                "[headpos] source='%s' did not yield head_pos data; "
+                "falling back to source='compute' (compute_head_pos_from_raw).",
+                source_used,
+            )
+            fallback_cfg = dict(hpp_cfg) if isinstance(hpp_cfg, dict) else {}
+            fallback_cfg["source"] = "compute"
+            headpos_result = prepare_headpos_from_config(
+                raw=raw,
+                cfg=fallback_cfg,
+                default_pos_path=None,
+                compute_headpos_fn=compute_head_pos_from_raw,
+                load_reference_headpos_fn=_load_reference_headpos,
+                save_subset_fn=_save_subset_pos if fallback_cfg.get("write_subset", False) else None,
+                logger=logger,
+            )
+            head_pos_array = headpos_result.get("head_pos_abs", None)
+            destination = headpos_result.get("destination", None)
+            movement_enabled = bool(headpos_result.get("movement_enabled", False))
+            source_used = headpos_result.get("source_used", "compute")
+
+        # Decide what to pass into maxwell_filter as head_pos
+        if movement_enabled and head_pos_array is not None and len(head_pos_array) > 0:
+            head_pos_for_maxwell = head_pos_array
+            logger.info(
+                f"Head-pos for Maxwell (source='{source_used}'): "
+                f"n={head_pos_array.shape[0]}, "
+                f"abs_range=[{head_pos_array[0, 0]:.3f}, {head_pos_array[-1, 0]:.3f}] s "
+                "(movement compensation enabled)."
+            )
+        else:
+            head_pos_for_maxwell = None
+            if not movement_requested:
+                logger.info(
+                    "movement_compensation=False in YAML – Maxwell will use static origin/destination only."
+                )
+            else:
+                logger.info(
+                    "No usable head_pos for Maxwell (source='%s') – running tSSS without movement compensation.",
+                    source_used,
+                )
+
+        # Compute and plot head-movement statistics if head_pos is available
+        if head_pos_array is not None and len(head_pos_array) > 0:
+            head_movement_stats = compute_head_movement_stats(head_pos_array)
+            if head_movement_stats is not None:
+                logger.info(
+                    "Head movement: max displacement "
+                    f"{head_movement_stats['translation_stats_mm']['max_displacement']:.1f} mm, "
+                    f"max rotation {head_movement_stats['rotation_stats_deg']['max_rotation']:.1f}°"
+                )
+            plot_head_movement(head_pos_array, plots_dir, logger=logger)
+        else:
+            head_movement_stats = None
+            logger.info("No head position data available; skipping head-movement metrics and plot.")
+
+        # ---------------- 7. Maxwell Filter (tSSS) ----------------
+        utils.log_section("7. Maxwell Filter (tSSS)")
+
+        # Resolve YAML options for Maxwell/tSSS
+        st_duration = (
+            float(hpp_cfg.get("st_duration", 10.0))
+            if isinstance(hpp_cfg, dict)
+            else 10.0
+        )
+        use_headshape_origin = (
+            bool(hpp_cfg.get("use_headshape_origin", True))
+            if isinstance(hpp_cfg, dict)
+            else True
+        )
+        use_destination = (
+            bool(hpp_cfg.get("use_destination", True))
+            if isinstance(hpp_cfg, dict)
+            else True
+        )
+
+        logger.info(
+            "Applying Maxwell filter (tSSS) with "
+            f"{'movement compensation' if head_pos_for_maxwell is not None else 'NO movement compensation'}, "
+            f"st_duration={st_duration:.1f}s, "
+            f"{'headshape origin' if use_headshape_origin else 'auto origin'}, "
+            f"{'destination enabled' if use_destination else 'no destination'}."
+        )
+
+        # Prepare head_pos array for mne.preprocessing.maxwell_filter
+        hp = None
+        if head_pos_for_maxwell is not None and len(head_pos_for_maxwell) > 0:
+            hp = np.asarray(head_pos_for_maxwell, float)
+
+        # Destination: must be a 3-vector (HEAD coords, meters) or None
+        dest_arr = None
+        if use_destination:
+            if isinstance(destination, str):
+                raise RuntimeError(
+                    f"Maxwell destination must be a 3-vector (meters) or None, "
+                    f"got string '{destination}'. "
+                    "Ensure headpos_utils resolved destination numerically before calling Maxwell."
+                )
+            elif destination is not None:
+                dest_arr = np.asarray(destination, float).reshape(3,)
+                logger.info(
+                    f"[SSS] Using HEAD-frame destination from head_pos: "
+                    f"{dest_arr.round(4).tolist()} m"
+                )
+            else:
+                logger.info("[SSS] No destination computed – proceeding without destination.")
+        else:
+            logger.info("[SSS] use_destination=False – proceeding without destination.")
+
+        # Origin: either a headshape-based origin (HEAD frame, meters)
+        # or MNE's built-in auto origin if disabled or if fit fails.
+        origin_head = None
+        if use_headshape_origin:
             try:
-                head_pos_array = utils.mne.chpi.read_head_pos(head_pos_path)
-
-                if head_pos_array is not None and len(head_pos_array) > 0:
-                    translations_mm = head_pos_array[:, 1:4] * 1000
-                    rotations_deg = head_pos_array[:, 4:7] * (180 / np.pi)
-
-                    head_movement_stats = {
-                        "head_pos_file": head_pos_path,
-                        "n_timepoints": int(len(head_pos_array)),
-                        "duration_sec": float(head_pos_array[-1, 0] - head_pos_array[0, 0]),
-                        "translation_stats_mm": {
-                            "mean": [float(x) for x in translations_mm.mean(axis=0)],
-                            "std": [float(x) for x in translations_mm.std(axis=0)],
-                            "max_displacement": float(np.sqrt((translations_mm ** 2).sum(axis=1)).max()),
-                            "total_movement": float(np.sqrt(np.diff(translations_mm, axis=0) ** 2).sum())
-                        },
-                        "rotation_stats_deg": {
-                            "mean": [float(x) for x in rotations_deg.mean(axis=0)],
-                            "std": [float(x) for x in rotations_deg.std(axis=0)],
-                            "max_rotation": float(np.sqrt((rotations_deg ** 2).sum(axis=1)).max()),
-                            "total_rotation": float(np.sqrt(np.diff(rotations_deg, axis=0) ** 2).sum())
-                        }
-                    }
-                    logger.info(
-                        f"Head movement: max displacement {head_movement_stats['translation_stats_mm']['max_displacement']:.1f}mm, "
-                        f"max rotation {head_movement_stats['rotation_stats_deg']['max_rotation']:.1f}°")
-
+                origin_head = utils._fit_origin_from_headshape(raw.info)
+                logger.info(
+                    f"[SSS] Using explicit headshape origin (HEAD): "
+                    f"{origin_head.round(4).tolist()} m"
+                )
             except Exception as e:
-                logger.warning(f"Could not read head position file: {head_pos_path}\n{e}")
+                origin_head = None
+                logger.warning(
+                    f"[SSS] Headshape-origin fit failed ({e}); falling back to MNE auto origin."
+                )
+        else:
+            logger.info("[SSS] use_headshape_origin=False – using MNE auto origin.")
 
-    bids_path_deriv = bids_path.copy().update(
-        root=Path(bids_root) / "derivatives" / p.get("checkpoint", {}).get("pipeline_name", "preprocessing"),
-        suffix="meg", description="preproc", extension=".fif"
-    )
-    out_fif = bids_path_deriv.fpath
-    plots_dir = os.path.join(os.path.dirname(out_fif), "plots")
-    os.makedirs(plots_dir, exist_ok=True)
+        # Assemble arguments for Maxwell filter
+        maxwell_kwargs = dict(
+            calibration=str(checked_paths["calibration_file"]),
+            cross_talk=str(checked_paths["cross_talk_file"]),
+            head_pos=hp,           # None or aligned absolute times (movement comp)
+            st_duration=st_duration,
+            verbose=False,
+        )
+        if origin_head is not None:
+            maxwell_kwargs["origin"] = origin_head
+        if dest_arr is not None:
+            maxwell_kwargs["destination"] = dest_arr
 
-    if movement_enabled and head_pos_array is not None:
-        utils.plot_head_movement(head_pos_array, plots_dir)
+        # Final Maxwell filter call
+        raw = mne.preprocessing.maxwell_filter(raw, **maxwell_kwargs)
 
-    utils.log_section("4. EEG Channel Setup")
-    eeg_setup_results = utils.prepare_eeg_channels(raw, checked_paths["montage"], logger)
+        # Post-Maxwell PSD and quality metrics (single, non-duplicated)
+        utils.plot_psd_and_peaks(raw, "After Maxwell", plots_dir)
 
-    utils.log_section("5. Metadata Repair")
-    metadata_repair_results = utils.apply_metadata_repairs(raw, p.get('metadata_fixes', {}))
-
-    utils.log_section("6. PSD & RMS Diagnostics (Pre-filtering)")
-    utils.qc_meg_raw(raw, plots_dir)
-    utils.plot_psd_and_peaks(raw, "Raw PSD Before Maxwell", plots_dir)
-
-    metrics_pre_maxwell = utils.compute_meg_quality_metrics(raw, "pre_maxwell")
-
-    utils.log_section("7. Maxwell Filter (tSSS)")
-    raw = utils.apply_maxwell_filter(
-        raw,
-        head_pos=head_pos_array,
-        destination=None,
-        cal=str(checked_paths["calibration_file"]),
-        crosstalk=str(checked_paths["cross_talk_file"])
-    )
-    utils.plot_psd_and_peaks(raw, "After Maxwell", plots_dir)
-
-    metrics_post_maxwell = utils.compute_meg_quality_metrics(raw, "post_maxwell")
-    maxwell_quality_metrics = utils.log_maxwell_quality_results(
-        metrics_pre_maxwell,
-        metrics_post_maxwell,
-        logger
-    )
+        metrics_post_maxwell = utils.compute_meg_quality_metrics(raw, "post_maxwell")
+        maxwell_quality_metrics = utils.log_maxwell_quality_results(
+            metrics_pre_maxwell,
+            metrics_post_maxwell,
+            logger,
+        )
+        # ---- end Maxwell section ----
 
     utils.log_section("7b. Estimate MEG Rank After Maxwell")
+
     try:
-        empirical_rank = mne.compute_rank(raw, picks='meg')
+        # Modern MNE API: compute rank of all channel types at once
+        rank_dict = mne.compute_rank(raw)
+
+        meg_rank = None
+        # MNE may store the MEG rank under the key "meg" or "{kind}_meg"
+        # but "meg" is standard; we guard for robustness.
+        if "meg" in rank_dict:
+            meg_rank = rank_dict["meg"]
+        else:
+            # fallback: look for any key that ends with 'meg'
+            for k, v in rank_dict.items():
+                if "meg" in k.lower():
+                    meg_rank = v
+                    break
+
+        logger.info(f"Estimated MEG rank after Maxwell: {meg_rank}")
         rank_info = {
-            "meg_rank": int(empirical_rank.get('meg', 0)),
+            "meg_rank": meg_rank,
             "method": "empirical",
-            "computed_after": "maxwell_filtering"
+            "computed_after": "maxwell_filtering",
         }
-        logger.info(f"Estimated MEG rank after Maxwell: {rank_info['meg_rank']}")
+
     except Exception as e:
         logger.warning(f"Rank estimation failed: {e}")
         rank_info = {"error": str(e), "meg_rank": None}
+
+    raw.load_data()
 
     utils.log_section("8. Notch Filter")
     line_freq = float(p.get("line_freq", 60.0))

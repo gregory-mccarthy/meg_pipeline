@@ -1,0 +1,12 @@
+name: mne
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - mne=1.10
+  - mne-bids
+  - autoreject
+  - matplotlib
+  - ruamel.yaml
+  - mne-qt-browser
+  # NO pyqt, NO qt-main, NO pyqt5, NO qt5

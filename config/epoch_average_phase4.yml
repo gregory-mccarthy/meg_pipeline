@@ -1,0 +1,63 @@
+# ==== BIDS & run list ====
+bids_root: "/path/to/your/BIDS"   # <- change me
+
+inputs:
+  - subject: "001"
+    session: "1"
+    task: "faces"
+    run: "01"
+
+# ==== Global defaults ====
+stim_channel: "STI101"            # default MEGIN summed trigger channel
+
+# Default epoch window (override per condition below if desired)
+tmin: -0.1
+tmax: 0.5
+baseline: [null, 0.0]
+
+# Optional filtering / rejection (keep or remove as you prefer)
+use_reject: true
+reject:
+  mag: 4e-12
+  grad: 4000e-13
+  eeg: 100e-6
+
+filter:
+  l_freq: 0.1
+  h_freq: 200.0
+
+# (Optional) add short BAD annotation around each event onset
+artifact_suppression:
+  window: [-0.005, 0.005]
+
+# ==== Conditions ====
+# Bit layout from the user’s mapping:
+# - Face identity = bits 1–3 (mask 0x007)
+# - ISI/Context   = bits 4–6 (mask 0x038)  → ensure face stimuli (excludes 6/7)
+# - Target flag   = bit 7     (mask 0x040)
+# - “Target-face” context code is bits 4–6 == 0x038 (all three set)
+
+conditions:
+  # All faces that are NOT targets:
+  #   - must look like a real stimulus: require at least one ISI/Context bit (bits 4–6) set
+  #   - exclude targets: bit 7 must be 0
+  faces_non_target:
+    mask: 0x38             # require some context bit (bits 4–6) present → excludes block start/end
+    mask_mode: "any"
+    not_bits: [7]          # bit 7 (Target flag) must be unset
+
+  # All faces that ARE targets:
+  #   - simplest and most explicit: require Target flag (bit 7) set
+  #   - (If the paradigm also marks targets by setting bits 4–6 == 0x38,
+  #      those will be included automatically whenever bit 7 is set too.)
+  faces_target:
+    any_bits: [7]          # bit 7 (Target flag)
+
+# (Optional) per-condition windows
+epoch_windows:
+  faces_non_target: { tmin: -0.1, tmax: 0.5 }
+  faces_target:     { tmin: -0.1, tmax: 0.5 }
+
+# (Optional) composites (not needed here, but example shown)
+# composites:
+#   diff_targets_vs_nontargets: "faces_target - faces_non_target"

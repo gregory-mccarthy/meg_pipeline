@@ -1,0 +1,130 @@
+# ============================================================
+# Gold-Standard MEG/EEG Preprocessing — OOD (HPC) CONFIG
+# Runs Stage 1 + Stage 2 entirely on the HPC (no rsync/cache)
+# ============================================================
+
+# -------- BIDS IDENTIFIERS --------
+subject: "010MPA"
+session: "01"
+run: "01"
+task: "stimulation"
+
+# On OOD you are “on” the HPC, so point straight at GPFS.
+bids_root: /gpfs/milgram/scratch/mccarthy/gm33/BIDS/epi
+
+# -------- HYBRID / REMOTE I/O --------
+# Disable hybrid transfers on OOD — we read/write directly on GPFS.
+remote_io:
+  enabled: false
+
+# -------- HEAD MOVEMENT COMPENSATION --------
+head_movement:
+  enabled: true
+
+# -------- MAXWELL (tSSS) CALIBRATION FILES --------
+# (resolved relative to repo root if not absolute)
+calibration_file: cals/sss_cal_factory_20230619.dat
+cross_talk_file: cals/ct_sparse_triux2.fif
+
+# -------- LINE-NOISE NOTCH --------
+line_freq: 60.0
+
+# -------- STIM EVENTS (bitmask) --------
+stim_include_mask: 0xC000   # use bits 14 & 15
+
+# -------- HEAD POSITION ORIGIN --------
+# null → use dev_head_t from the file; or give a .fif path / coordinates
+head_position_origin: null
+
+# -------- EEG HANDLING --------
+eeg_handling:
+  montage: montage/EasyCap_53.sfp
+
+# -------- INTERACTIVE FLAGS (OOD desktop supports Qt windows) --------
+interactive_bad_channels: true
+interactive_ica: true
+
+# Optional manual overrides
+manual_bad_channels: []
+ica_exclude_eeg: []
+ica_exclude_meg: []
+
+autoreject:
+  # -------- ENABLE/DISABLE --------
+  enabled: true
+
+  # -------- CHANNEL SELECTION --------
+  which_types: [eeg, mag]        # Channel types to include in analysis
+
+  # -------- PREPROCESSING FOR AUTOREJECT --------
+  filter:
+    highpass: 1.0                # Hz - highpass filter for AR analysis
+    lowpass: 40.0                # Hz - lowpass filter for AR analysis
+    resample_hz: null            # Hz - optional resampling for AR (null = no resample)
+
+  epoch:
+    duration: 2.0                # s - epoch length for AR analysis
+    tmin: 0.0                    # s - epoch start time
+    tmax: 2.0                    # s - epoch end time
+
+  # -------- AUTOREJECT ALGORITHM PARAMETERS --------
+  cv_folds: 5                    # Cross-validation folds (3-8, lower=more aggressive)
+  thresh_method: 'random_search' # Threshold search: 'random_search' or 'bayesian_optimization'
+  n_interpolate: [0]             # Interpolation levels to try [0]=no interpolation
+
+  # -------- BAD CHANNEL/EPOCH DETECTION THRESHOLDS --------
+  consensus_thresh: 0.3          # Channel marked bad if rejected in >30% of epochs
+  global_epoch_thresh: 0.5       # Epoch marked bad if >50% of channels are rejected
+
+# -------- ICA PREPROCESSING --------
+ica_preprocessing:
+  eeg:
+    highpass: 1.0
+    lowpass: 40.0
+    resample_hz: 200
+    max_ica_duration_sec: 1800   # 30 min cap; set null to disable
+    interactive: true
+    random_state: 97
+  meg:
+    highpass: 1.0
+    lowpass: 40.0
+    resample_hz: 200
+    max_ica_duration_sec: 1800
+    interactive: true
+    random_state: 97
+
+# -------- FINAL FILTER / DOWNSAMPLING (before save) --------
+final_filter:
+  highpass: null
+  lowpass: null
+  resample_hz: null
+  drop_channel_types:
+    - hpi
+    - hlc
+    - coil
+
+# -------- OPTIONAL METADATA FIXES --------
+metadata_fixes:
+  fix_non_eeg_channels: {}
+  fix_generic: {}
+  expert_patch: |
+    print("✅ Expert patch executed successfully.")
+
+# -------- CHECKPOINT / RESUME --------
+# Stage 1 writes *_desc-parproc_meg.fif + *_manifest.yaml under derivatives/
+# Stage 2 resumes from that checkpoint (same HPC filesystem).
+checkpoint:
+  enabled: true
+  exit_after_checkpoint: false
+  derivatives_root: derivatives
+  pipeline_name: preprocessing
+  atomic_writes: true
+  allow_resume_with_different_yaml: true     # OOD often tweaks YAML vs Stage 1; allow resume
+  validate_checkpoint_integrity: true
+  backup_before_overwrite: false
+  max_checkpoint_age_hours: 168
+
+# -------- REPRODUCIBILITY --------
+repro:
+  random_state_global: 42
+  record_environment: true

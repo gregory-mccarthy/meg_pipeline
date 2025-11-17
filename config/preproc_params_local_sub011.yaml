@@ -1,0 +1,188 @@
+# ============================================================
+# MEG/EEG Preprocessing Configuration — Local
+# This uses ~/data/bids-test data path
+# ============================================================
+#  [oai_citation:0‡preproc_params_local_sub011.yaml](sediment://file_00000000945871f79e7db291d0c9a3e4)
+
+# ---------------- BIDS DATASET IDENTIFIERS ------------------
+subject: "011"
+session: "01"
+task: "rest"
+run: "01"
+
+# ---------------- (OPTIONAL) SUB-SEGMENT TIME WINDOW --------
+# Analyze only a portion of the recording.
+# Accepts "hh:mm:ss", "mm:ss", seconds (int/float), or null.
+# Omit this block to process the full file.
+time_window:
+  start: "20:00"    # begin at 0 minutes (start of this run)
+  end:   "30:00"    # end at 10 minutes (first 10-minute window)
+
+# The BIDS root for this data set
+bids_root: "/Users/gm33/data/bids-test"
+
+# ---------------- HYBRID / REMOTE I/O -----------------------
+remote_io:
+  enabled: false
+  hpc_host: "transfer-milgram.ycrc.yale.edu"
+  hpc_user: "gm33"
+  remote_bids_root: "/gpfs/milgram/pi/nobre/meg_shared/epilepsy/epi"
+  local_temp_dir: "./temp"
+
+# ---------------- CALIBRATION (tSSS) ------------------------
+# Use absolute paths or repo-relative (e.g., cals/sss_cal_factory_20230619.dat)
+calibration_file: "/Users/gm33/data/cals/sss_cal_factory_20230619.dat"
+cross_talk_file: "/Users/gm33/data/cals/ct_sparse_triux2.fif"
+
+# ---------------- BASIC SIGNAL PROCESSING -------------------
+line_freq: 60.0
+stim_include_mask: 0xFFFF
+
+# Head origin for tSSS in HEAD coordinates (meters).
+# Options:
+#   - null           : let MNE fit origin from headshape (MNE auto; still works)
+#   - [x, y, z]      : explicit HEAD coordinates in meters (e.g. [0.0, 0.0, 0.04])
+#   - "fit"          : (legacy) force fit from this run's headshape
+#   - {"from_run": "01"} : reuse origin fitted from a reference run (future use)
+# NOTE: The Maxwell code now uses head_position_processing.use_headshape_origin
+# to decide whether to call the headshape fitter. Leaving this as null is fine.
+head_position_origin: null
+
+# ---------------- HEAD POSITION PROCESSING -------------------
+# Consumed by headpos_utils.prepare_headpos_from_config() and the Maxwell
+# block. For this test we want:
+#   - source="file"              : use precomputed .pos for the full 60-min run
+#   - movement_compensation=true : pass head_pos to tSSS (dynamic correction)
+#   - write_subset=true          : save 0–600 s subset .pos
+#   - destination="none"         : no destination (each run uses its own origin)
+#   - st_duration=10.0           : tSSS window length (seconds)
+#   - use_headshape_origin=true  : fit SSS origin from headshape
+#   - use_destination=false      : do not pass a destination to maxwell_filter
+head_position_processing:
+  # Source of head position data
+  source: "file"
+  file_path: "/Users/gm33/data/bids-test/sub-011/ses-01/meg/sub-011_ses-01_task-rest_run-01_headpos.pos"
+
+  # Enable dynamic movement compensation in tSSS
+  movement_compensation: true
+
+  # Write a window-specific head_pos file aligned to the cropped 600 s segment
+  write_subset: true
+
+  # Destination pose for Maxwell:
+  # For this baseline test, disable destination so Maxwell uses only the origin.
+  # (MNE will still use a consistent head frame; no static re-centering.)
+  destination: "none"     # was "median"
+
+  # tSSS sliding window duration in seconds
+  st_duration: 10.0
+
+  # Use a headshape-fitted origin (HEAD frame, meters) for SSS.
+  # If false or if fitting fails, the code falls back to MNE's auto origin.
+  use_headshape_origin: true
+
+  # Control whether to pass a destination to maxwell_filter.
+  # For this test we explicitly disable it to get the cleanest baseline.
+  use_destination: false
+
+  # Other advanced options can remain at defaults:
+  # force_recompute: false
+  # subset_naming: "desc-crop"
+  # destination_coordinates: [-0.075, 0.012, 0.030]
+  # destination_reference_run: 1
+
+# ---------------- TRIGGER HANDLING ---------------------------
+triggers:
+  stem_channel: "STI101"
+  mask: "0xFFFF"
+  max_settle_ms: 6.0
+  refractory_ms: 20.0
+  auto_mask_stuck_bits: false
+  stuck_high_frac: 0.98
+  stuck_low_frac: 0.02
+
+# ---------------- EEG MONTAGE -------------------------------
+eeg_handling:
+  montage: "/Users/gm33/data/montage/EasyCap_53.sfp"
+
+# ---------------- INTERACTIVE CONTROLS ----------------------
+interactive_bad_channels: true
+interactive_ica: true
+
+# ---------------- MANUAL OVERRIDES --------------------------
+manual_bad_channels: []
+ica_exclude_eeg: []
+ica_exclude_meg: []
+
+# ---------------- AUTOREJECT (MEG/EEG) ----------------------
+# NOTE: [mag, grad] + n_interpolate: [0] is fairly aggressive.
+# For production you may want to allow interpolation, e.g. [0, 1, 2, 4].
+autoredit:
+  enabled: true
+  which_types: [mag, grad]        # add 'eeg' if desired
+  filter:
+    highpass: 1.0
+    lowpass: 40.0
+    resample_hz: 100
+  epoch:
+    duration: 2.0
+    tmin: 0.0
+    tmax: 2.0
+  cv_folds: 5
+  thresh_method: "random_search"
+  n_interpolate: [0]
+  verbose: true
+  consensus_thresh: 0.3
+  global_epoch_thresh: 0.5
+
+# ---------------- ICA PREPROCESSING -------------------------
+ica_preprocessing:
+  eeg:
+    highpass: 1.0
+    lowpass: 40.0
+    resample_hz: 100
+    max_ica_duration_sec: 1800
+    interactive: true
+    random_state: 97
+  meg:
+    highpass: 1.0
+    lowpass: 40.0
+    resample_hz: 100
+    max_ica_duration_sec: 1800
+    interactive: true
+    random_state: 97
+
+# ---------------- FINAL OUTPUT FILTER -----------------------
+final_filter:
+  highpass: null
+  lowpass: 55.0
+  resample_hz: null
+  drop_channel_types:
+    - hpi
+    - hlc
+    - coil
+
+# ---------------- CHECKPOINT / RESUME -----------------------
+checkpoint:
+  enabled: true
+  exit_after_checkpoint: false
+  derivatives_root: "derivatives"
+  pipeline_name: "preprocessing"
+  atomic_writes: true
+  allow_resume_with_different_yaml: true
+  validate_checkpoint_integrity: true
+  backup_before_overwrite: false
+  max_checkpoint_age_hours: 168
+
+# ---------------- REPRODUCIBILITY ---------------------------
+repro:
+  random_state_global: 42
+  record_environment: true
+
+# ---------------- METADATA FIXES ----------------------------
+metadata_fixes:
+  fix_non_eeg_channels: {}
+  fix_generic: {}
+  expert_patch: |
+    # Optional expert Python hook.
+    # print("Expert patch active for sub-011.")

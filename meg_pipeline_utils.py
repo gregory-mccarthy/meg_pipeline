@@ -2030,10 +2030,12 @@ def run_ica(raw: mne.io.Raw, config: dict, output_path: Path, modality: str) -> 
     logger.info(f"Excluded {modality.upper()} ICA components: {exclude}")
     return raw_clean, exclude
 
+from mne.bem import fit_sphere_to_headshape
+
 def _fit_origin_from_headshape(info: mne.Info) -> np.ndarray:
     """
     Fit head-sphere center from HEAD-frame head-shape points (EXTRA + CARDINAL).
-    Robust to MNE return-shape changes. Returns (x, y, z) in meters (HEAD).
+    Returns (x, y, z) in meters in the HEAD coordinate frame.
     """
     dig = info.get("dig", None) or []
     usable = [
@@ -2042,21 +2044,43 @@ def _fit_origin_from_headshape(info: mne.Info) -> np.ndarray:
         and d.get("kind") in (FIFF.FIFFV_POINT_EXTRA, FIFF.FIFFV_POINT_CARDINAL)
     ]
     if len(usable) < 3:
-        raise RuntimeError("Not enough HEAD-frame head-shape points to fit SSS origin.")
+        raise RuntimeError(
+            "Not enough HEAD-frame head-shape points to fit SSS origin."
+        )
 
-    res = fit_sphere_to_headshape(info=info)
-    # MNE versions have returned (origin, radius), (radius, origin), or (origin, radius, <extra>)
+    # Ask explicitly for headshape points and meters
+    res = fit_sphere_to_headshape(
+        info,
+        dig_kinds=("extra", "cardinal"),
+        units="m",
+    )
+
     origin = None
-    # Flatten tuple to inspect each element
+
+    # MNE versions may return (origin, radius), (radius, origin),
+    # (origin, radius, ...), or even just origin.
     if isinstance(res, tuple):
         for item in res:
             arr = np.asarray(item)
-            if arr.shape == (3,):        # likely the origin
+            if arr.shape == (3,):
                 origin = arr.astype(float)
-    # Final check
+                break
+    else:
+        arr = np.asarray(res)
+        if arr.shape == (3,):
+            origin = arr.astype(float)
+
     if origin is None:
-        raise RuntimeError(f"Unexpected return from fit_sphere_to_headshape: {type(res)} / {res}")
+        raise RuntimeError(
+            f"Unexpected return from fit_sphere_to_headshape: "
+            f"type={type(res)}, shapes={[np.asarray(x).shape for x in (res if isinstance(res, tuple) else [res])]}"
+        )
+
     return origin
+
+import numpy as np
+import mne
+from mne.bem import fit_sphere_to_headshape
 
 def apply_maxwell_filter(
     raw: mne.io.Raw,
@@ -2064,27 +2088,102 @@ def apply_maxwell_filter(
     destination=None,
     cal=None,
     crosstalk=None,
-    *,
-    fallback_origin: tuple[float, float, float] = (0.0, 0.0, 0.04),
 ) -> mne.io.Raw:
     """
-    Robust tSSS wrapper that ignores EEG electrode geometry:
-      • Origin fitted from head-shape (EXTRA + CARDINAL) in HEAD frame
-      • No 'picks' kwarg (older MNE); assume upstream dropped EEG if needed
-      • Fallback origin if fit fails
+    tSSS wrapper for Elekta/MEGIN data.
+
+    Assumes:
+      • `raw` may be cropped to a time window.
+      • `head_pos` is either:
+            - None
+            - a path to a .pos file
+            - an array with times in ABSOLUTE session seconds
+        (Typically the array returned by headpos_utils for this Raw window.)
+      • `destination` is either None or a 3-vector (HEAD coordinates, meters).
+
+    Behavior:
+      • Resolve `head_pos` to an array (if needed) and clip it to this Raw's
+        absolute window [raw.first_time, raw.first_time + duration].
+      • Fit HEAD origin from Polhemus headshape using fit_sphere_to_headshape.
+      • Pass everything into mne.preprocessing.maxwell_filter with coord_frame="head".
     """
     logger.info("Applying Maxwell filter (tSSS)...")
-    try:
-        origin = _fit_origin_from_headshape(raw.info)
-        logger.info(f"[SSS] Using fitted HEAD origin: {origin.round(4).tolist()} m")
-    except Exception as e:
-        origin = np.asarray(fallback_origin, float)
-        logger.warning(f"[SSS] Head-shape origin fit failed ({e}); using fallback {origin.tolist()} m")
 
-    return mne.preprocessing.maxwell_filter(
+    # ---------- Resolve head_pos to array ----------
+    hp = None
+    try:
+        if head_pos is None:
+            hp = None
+        elif isinstance(head_pos, str):
+            hp = mne.chpi.read_head_pos(head_pos)
+            logger.info(f"Head-pos: loaded {hp.shape[0]} samples from file.")
+        else:
+            hp = np.asarray(head_pos, dtype=float)
+            logger.info(f"Head-pos: received array with {hp.shape[0]} samples.")
+    except Exception as e:
+        logger.warning(f"Head-pos: failed to load/convert ({e}); disabling movement compensation.")
+        hp = None
+
+    # ---------- Clip head_pos to Raw's absolute window ----------
+    if hp is not None and hp.size > 0:
+        hp = hp[np.argsort(hp[:, 0])]  # sort by time
+
+        ft_abs = float(raw.first_time)
+        dur = float(raw.times[-1])
+        end_abs = ft_abs + dur
+
+        logger.info(f"Raw absolute window: [{ft_abs:.3f}, {end_abs:.3f}]s")
+        logger.info(f"Head-pos time range: [{hp[0, 0]:.3f}, {hp[-1, 0]:.3f}]s")
+
+        mask = (hp[:, 0] >= ft_abs - 1e-6) & (hp[:, 0] <= end_abs + 1e-6)
+        n_before, n_after = len(hp), int(mask.sum())
+        if n_after == 0:
+            logger.warning(
+                "Head-pos: no samples overlap the Raw window; "
+                "disabling movement compensation."
+            )
+            hp = None
+        else:
+            if n_after < n_before:
+                logger.info(f"Head-pos: clipped {n_before - n_after} samples outside Raw window.")
+            hp = hp[mask]
+            if not np.all(np.diff(hp[:, 0]) >= 0):
+                hp = hp[np.argsort(hp[:, 0])]
+            logger.info(
+                f"Head-pos after clipping: [{hp[0, 0]:.3f}, {hp[-1, 0]:.3f}]s, n={len(hp)} samples."
+            )
+
+    # ---------- destination must be 3-vector or None ----------
+    if isinstance(destination, str):
+        raise RuntimeError(
+            "destination must be a 3-vector in meters or None; strings like 'auto' are not supported."
+        )
+
+    # ---------- Fit HEAD origin from Polhemus headshape ----------
+    try:
+        center, radius = fit_sphere_to_headshape(
+            raw.info,
+            dig_kinds="auto",
+            units="m",
+        )
+        origin = np.asarray(center, float).reshape(3)
+        logger.info(
+            f"[SSS] Using HEAD origin from headshape: center={origin.round(4).tolist()} m, "
+            f"radius={radius:.3f} m"
+        )
+    except Exception as e:
+        # as a last resort, fall back to MNE's default [0., 0., 0.04] m
+        origin = np.array([0.0, 0.0, 0.04], float)
+        logger.warning(
+            f"[SSS] fit_sphere_to_headshape failed ({e}); "
+            f"using fallback HEAD origin {origin.tolist()} m"
+        )
+
+    # ---------- Call MNE ----------
+    raw_sss = mne.preprocessing.maxwell_filter(
         raw,
-        origin=origin,
-        head_pos=head_pos,
+        origin=origin,        # explicit HEAD-frame center, 3-vector
+        head_pos=hp,          # np.ndarray or None
         destination=destination,
         calibration=cal,
         cross_talk=crosstalk,
@@ -2092,6 +2191,8 @@ def apply_maxwell_filter(
         coord_frame="head",
         verbose="error",
     )
+
+    return raw_sss
 
 # === Composite trigger extraction (early-onset timing, final-code labeling) ===
 import numpy as np

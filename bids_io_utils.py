@@ -55,6 +55,48 @@ def norm_split(val) -> Optional[str]:
 def _ent(stem: str, key: str, val: Optional[str]) -> str:
     return f"{stem}_{key}-{val}" if not _none_like(val) else stem
 
+# ####################################################
+# Time window parsing helpers (additive; safe)
+# ####################################################
+
+def _none_like(val) -> bool:
+    return val is None or (isinstance(val, str) and val.strip().lower() in {"", "none", "null"})
+
+def _parse_hms_or_float(val):
+    """Return seconds (float) from 'hh:mm:ss' | 'mm:ss' | float/int | None."""
+    if _none_like(val):
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip()
+    parts = s.split(":")
+    try:
+        if len(parts) == 3:
+            h, m, sec = parts
+            return int(h) * 3600 + int(m) * 60 + float(sec)
+        elif len(parts) == 2:
+            m, sec = parts
+            return int(m) * 60 + float(sec)
+        else:
+            return float(s)
+    except Exception as e:
+        raise ValueError(f"Unrecognized time format '{val}': {e}")
+
+def parse_time_window(cfg: dict):
+    """Read optional time window from YAML-like dict.
+    Returns (tmin, tmax) in seconds or None.
+    """
+    tw = (cfg or {}).get("time_window")
+    if not tw:
+        return None
+    tmin = _parse_hms_or_float(tw.get("start"))
+    tmax = _parse_hms_or_float(tw.get("end"))
+    if tmin is None and tmax is None:
+        return None
+    if (tmin is not None) and (tmax is not None) and (tmax <= tmin):
+        raise ValueError(f"time_window end ({tmax}) must be > start ({tmin}).")
+    return (tmin, tmax)
+
 # =============================================================================
 # Fault-tolerant helpers: numeric equivalence and on-disk probing
 # =============================================================================

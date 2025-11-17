@@ -1,0 +1,217 @@
+# ============================================================
+# Gold‑Standard MEG/EEG Preprocessing — Configuration (YAML)
+# ------------------------------------------------------------
+# This file controls an MNE-Python pipeline with a checkpoint
+# seam between headless AutoReject (Stage 1) and interactive
+# review (Stage 2). Comments above each section explain usage.
+# ============================================================
+
+
+# ------------------------------------------------------------
+# BIDS IDENTIFIERS (who/what to process)
+# - Required for locating the raw file and naming derivatives.
+# ------------------------------------------------------------
+bids_root: /Users/gm33/data/epi
+subject: "010MPA"
+session: "01"
+run: "01"
+task: "stimulation"
+
+
+# ------------------------------------------------------------
+# HYBRID / REMOTE I/O
+# - Used when fetching data from / pushing results to HPC.
+# - temp_dir can serve as a local staging area.
+# ------------------------------------------------------------
+hpc_host: transfer-milgram.ycrc.yale.edu
+hpc_user: gm33
+temp_dir: ./temp
+
+
+# ------------------------------------------------------------
+# HEAD MOVEMENT COMPENSATION
+# - If enabled, compute/read head position and pass to tSSS.
+# ------------------------------------------------------------
+head_movement:
+  enabled: true
+
+
+# ------------------------------------------------------------
+# MAXWELL (tSSS) CALIBRATION FILES
+# - Site-specific cal/xtalk files required for MEG Maxwell.
+# ------------------------------------------------------------
+calibration_file: cals/sss_cal_factory_20230619.dat
+cross_talk_file: cals/ct_sparse_triux2.fif
+
+
+# ------------------------------------------------------------
+# LINE NOISE NOTCH
+# - Fundamental mains frequency; harmonics are derived.
+# ------------------------------------------------------------
+line_freq: 60.0
+
+
+# ------------------------------------------------------------
+# STIMULUS EVENT BITMASK
+# - Choose bits of the stim channel to include as events.
+# ------------------------------------------------------------
+stim_include_mask: 0xC000  # Only bits 14 and 15 included
+
+
+# ------------------------------------------------------------
+# HEAD POSITION ORIGIN
+# - null = use dev_head_t of current file
+# - OR provide a path to a .fif with desired head position
+# - OR provide explicit coordinates.
+# ------------------------------------------------------------
+head_position_origin: null
+
+
+# ------------------------------------------------------------
+# EEG HANDLING
+# - Montage or digitization file for EEG sensor geometry.
+# ------------------------------------------------------------
+eeg_handling:
+  montage: montage/EasyCap_53.sfp
+
+
+# ------------------------------------------------------------
+# QC & INTERACTIVE FLAGS
+# - Toggle interactive review steps in the pipeline.
+# ------------------------------------------------------------
+interactive_bad_channels: true
+interactive_ica: true
+
+# Manually mark channels bad (optional override).
+manual_bad_channels: []
+
+# Manually exclude ICA components (optional overrides).
+ica_exclude_eeg: []
+ica_exclude_meg: []
+
+
+# ------------------------------------------------------------
+# AUTOREJECT (BAD CHANNEL/EPOCH AUTO-DETECT)
+# - Stage 1 uses these to build filtered/downsampled copy.
+# - Channel types: pick among eeg, mag, grad.
+# - consensus_thresh: fraction of epochs a channel must fail.
+# - global_epoch_thresh: fraction of channels bad → epoch bad.
+# - FIXED: which_types now matches stage1.ransac_on for consistency
+# ------------------------------------------------------------
+autoreject:
+  enabled: true
+  filter:
+    highpass: 1.0        # Hz
+    lowpass: 40.0        # Hz
+    resample_hz: null    # Hz (optional)
+  epoch:
+    duration: 2.0        # seconds per fixed-length epoch
+    tmin: 0.0            # start (sec)
+    tmax: 2.0            # end (sec)
+  consensus_thresh: 0.3
+  global_epoch_thresh: 0.5
+  which_types: [eeg, mag]  # FIXED: matches ransac_on below
+
+
+# ------------------------------------------------------------
+# ICA PREPROCESSING
+# - Separate settings per modality before interactive review.
+# - random_state ensures reproducible ICA decomposition.
+# - IMPROVED: Added max duration limits for performance
+# ------------------------------------------------------------
+ica_preprocessing:
+  eeg:
+    highpass: 1.0
+    lowpass: 40.0
+    resample_hz: 200
+    max_ica_duration_sec: 1800  # 30 minutes max for ICA
+    interactive: true
+    random_state: 97
+
+  meg:
+    highpass: 1.0
+    lowpass: 40.0
+    resample_hz: 200
+    max_ica_duration_sec: 1800  # 30 minutes max for ICA
+    interactive: true
+    random_state: 97
+
+
+# ------------------------------------------------------------
+# FINAL FILTERING / DOWNSAMPLING (BEFORE SAVE)
+# - Applied after ICA and event annotation, right before write.
+# - drop_channel_types removes non-physiological channels.
+# ------------------------------------------------------------
+final_filter:
+  highpass: null
+  lowpass: null
+  resample_hz: null
+  drop_channel_types:
+    - hpi
+    - hlc
+    - coil
+
+
+# ------------------------------------------------------------
+# METADATA FIXES (OPTIONAL)
+# - Lightweight patches for mislabeled or missing metadata.
+# - expert_patch runs as Python; keep small & deterministic.
+# ------------------------------------------------------------
+metadata_fixes:
+  fix_non_eeg_channels: {}
+  fix_generic: {}
+  expert_patch: |
+    print("✅ Expert patch executed successfully.")
+
+
+# ------------------------------------------------------------
+# CHECKPOINT / RESUME
+# - Enables Stage 1 headless AR + manifest write, with option
+#   to exit immediately. Stage 2 resumes for interactive edit.
+# - derivatives_root + pipeline_name control output location.
+# - atomic_writes guards against half-written artifacts.
+# - IMPROVED: Added validation and backup options
+# ------------------------------------------------------------
+checkpoint:
+  enabled: true
+  exit_after_checkpoint: true
+  derivatives_root: derivatives
+  pipeline_name: preprocessing  # CHANGED from goldstd
+  cache_view_copy: false
+  atomic_writes: true
+  allow_resume_with_different_yaml: false
+  # NEW: Checkpoint validation and backup
+  validate_checkpoint_integrity: true
+  backup_before_overwrite: false  # CHANGED from true (no duplicates)
+  max_checkpoint_age_hours: 168  # 1 week
+
+
+# ------------------------------------------------------------
+# REPRODUCIBILITY
+# - Global seed and environment capture for deterministic runs.
+# ------------------------------------------------------------
+repro:
+  random_state_global: 42
+  record_environment: true
+
+
+# ------------------------------------------------------------
+# AUTOREJECT SPLIT (STAGE CONTROLS)
+# - Stage 1: which picks to analyze & whether to write annots.
+# - Stage 2: whether to re-filter viewer copy and log deltas.
+# - FIXED: ransac_on now matches autoreject.which_types
+# - IMPROVED: Added memory management options
+# ------------------------------------------------------------
+autoreject_split:
+  stage1:
+    picks: "eeg+meg"          # or "eeg+mag", "eeg+grad", "all"
+    ransac_on: ["eeg", "mag"] # FIXED: matches autoreject.which_types
+    write_annotations: true
+    # NEW: Memory management
+    process_types_separately: true  # Reduce peak memory usage
+  stage2:
+    re_filter_for_view: true
+    save_deltas_in_manifest: true
+    # NEW: Interactive workflow improvements
+    auto_save_review_progress: true
+    recovery_save_interval_sec: 300  # Save progress every 5 minutes
