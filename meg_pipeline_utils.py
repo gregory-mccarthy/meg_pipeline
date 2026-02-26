@@ -282,6 +282,10 @@ def run_autoreject_stage1(raw, cfg, bids_path, logger):
     # Get configuration
     chk_cfg = cfg.get("checkpoint", {})
     ar_cfg = cfg.get("autoreject", {})
+    # Backward compatibility: legacy 'apply' maps to new 'enabled'
+    if "enabled" not in ar_cfg and "apply" in ar_cfg:
+        ar_cfg = dict(ar_cfg)  # avoid mutating cfg in-place unexpectedly
+        ar_cfg["enabled"] = bool(ar_cfg["apply"])
 
     if not chk_cfg.get("enabled", True):
         logger.info("[AR Stage 1] Checkpointing disabled - skipping AutoReject")
@@ -520,22 +524,10 @@ def run_interactive_review_stage2(checkpoint_path, cfg, logger):
 
     # Transfer annotation changes
     if raw_filtered.annotations is not None and len(raw_filtered.annotations) > 0:
-        # Note: Annotations need to be scaled back if resampling was applied
-        if resample_hz and resample_hz != raw.info['sfreq']:
-            scale_factor = raw.info['sfreq'] / resample_hz
-            scaled_onsets = [onset * scale_factor for onset in raw_filtered.annotations.onset]
-            scaled_durations = [dur * scale_factor for dur in raw_filtered.annotations.duration]
-
-            from mne import Annotations
-            scaled_annotations = Annotations(
-                onset=scaled_onsets,
-                duration=scaled_durations,
-                description=list(raw_filtered.annotations.description),
-                orig_time=raw.annotations.orig_time if raw.annotations else None
-            )
-            raw.set_annotations(scaled_annotations)
-        else:
-            raw.set_annotations(raw_filtered.annotations)
+        # FIX: MNE Annotations are strictly in seconds. No scaling is needed
+        # when transferring between objects of different sampling rates.
+        # We use .copy() to ensure they persist when raw_filtered is deleted.
+        raw.set_annotations(raw_filtered.annotations.copy())
 
         final_n_annotations = len(raw.annotations)
         annotation_change = final_n_annotations - original_n_annotations
@@ -545,6 +537,8 @@ def run_interactive_review_stage2(checkpoint_path, cfg, logger):
     else:
         final_n_annotations = 0
         if original_n_annotations > 0:
+            # FIX: Properly clear annotations if the user manually deleted all of them
+            raw.set_annotations(None)
             logger.info(f"[AR Stage 2] All annotations removed")
 
     # Clean up filtered copy
@@ -1026,6 +1020,63 @@ def write_stage1_manifest(raw, cfg, bids_path, checkpoint_file=None,  # CHANGED:
 # Add these functions to your meg_pipeline_utils.py file
 # Required additional import: from scipy.stats import kurtosis
 
+
+def _extract_sss_info_from_proc_history(raw: "mne.io.Raw") -> Optional[Dict[str, Any]]:
+    """Robustly extract Maxwell/SSS metadata from raw.info['proc_history'].
+
+    MNE stores Maxwell filtering provenance in raw.info['proc_history'] with a 'max_info' dict.
+    Key names can vary across versions (e.g., in_order/out_order vs int_order/ext_order),
+    and sometimes values are nested. This helper tries multiple conventions and returns
+    None if nothing can be reliably extracted (rather than fabricating zeros).
+    """
+    ph = raw.info.get("proc_history", None)
+    if not isinstance(ph, (list, tuple)):
+        return None
+
+    for proc in ph:
+        if not (isinstance(proc, dict) and "max_info" in proc):
+            continue
+
+        max_info = proc.get("max_info", {})
+        if not isinstance(max_info, dict):
+            continue
+
+        # Some variants nest SSS info; collect candidate dicts to search.
+        candidates = [max_info]
+        for k in ("sss_info", "sss", "maxwell", "info"):
+            v = max_info.get(k, None)
+            if isinstance(v, dict):
+                candidates.append(v)
+
+        def _first_key(keys):
+            for d in candidates:
+                for k in keys:
+                    if k in d and d[k] is not None:
+                        return d[k]
+            return None
+
+        in_order = _first_key(("in_order", "int_order", "internal_order"))
+        out_order = _first_key(("out_order", "ext_order", "external_order"))
+        nbad = _first_key(("nbad", "n_bad", "bad_chs", "bad_channels"))
+        coord_frame = _first_key(("coord_frame", "frame", "coord_frame_id"))
+
+        def _to_int(x):
+            try:
+                return int(x)
+            except Exception:
+                return None
+
+        return {
+            "in_order": _to_int(in_order),
+            "out_order": _to_int(out_order),
+            "nbad": _to_int(nbad),
+            # Keep raw value (often FIFF int); mapping to labels can be done in logging.
+            "coord_frame": coord_frame if coord_frame is not None else None,
+        }
+
+    return None
+
+
 def compute_meg_quality_metrics(raw: mne.io.Raw, stage_name: str = "raw") -> Dict[str, Any]:
     """
     Compute MEG/EEG quality metrics (SI units) for a single pipeline stage.
@@ -1193,17 +1244,9 @@ def compute_meg_quality_metrics(raw: mne.io.Raw, stage_name: str = "raw") -> Dic
         metrics["chpi"] = {"has_hpi_meas": None, "n_coils": None, "active": None}
 
     # ---- SSS/Maxwell parameters if applied ----
-    if "proc_history" in raw.info:
-        for proc in raw.info["proc_history"]:
-            if isinstance(proc, dict) and "max_info" in proc:
-                max_info = proc["max_info"]
-                metrics["sss_info"] = {
-                    "in_order": int(max_info.get("in_order", 0)),
-                    "out_order": int(max_info.get("out_order", 0)),
-                    "nbad": int(max_info.get("nbad", 0)),
-                    "coord_frame": str(max_info.get("coord_frame", "unknown")),
-                }
-                break
+    sss_info = _extract_sss_info_from_proc_history(raw)
+    if sss_info is not None:
+        metrics["sss_info"] = sss_info
 
     return metrics
 
@@ -2381,9 +2424,16 @@ _BASE_DEFAULTS = {
         "crosstalk_file": None,
     },
     "autoreject": {
-        "apply": False,
-        "n_interpolates": [1, 4, 32],
-        "consensus": [0.5, 0.7, 0.9],
+        "enabled": False,  # IMPORTANT: default off
+        "which_types": ["mag", "grad", "eeg"],
+        "filter": {"highpass": 1.0, "lowpass": 40.0, "resample_hz": None},
+        "epoch": {"duration": 2.0, "tmin": 0.0, "tmax": 2.0},
+        "cv_folds": 5,
+        "thresh_method": "random_search",
+        "n_interpolate": [1, 4, 8],
+        "consensus_thresh": 0.3,
+        "global_epoch_thresh": 0.5,
+        "verbose": False,
     },
 }
 

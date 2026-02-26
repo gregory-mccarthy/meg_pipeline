@@ -386,8 +386,19 @@ def compute_head_movement_stats(head_pos: Optional[np.ndarray]) -> Optional[Dict
     if hp.shape[1] < 7:
         raise ValueError(f"head_pos must have at least 7 columns for movement stats; got {hp.shape}.")
 
-    translations_mm = hp[:, 1:4] * 1000.0               # meters → mm
-    rotations_deg = hp[:, 4:7] * (180.0 / np.pi)        # rad → deg
+    # FIX: Corrected column indices
+    quats = hp[:, 1:4]  # Quaternions
+    translations_mm = hp[:, 4:7] * 1000.0  # Translations (meters -> mm)
+
+    # Convert quaternions to approximate rotation angles (degrees)
+    # Magnitude of the quaternion vector (q1, q2, q3) is sin(theta/2)
+    q_norm = np.linalg.norm(quats, axis=1)
+    q_norm = np.clip(q_norm, -1.0, 1.0)  # Prevent arcsin NaNs
+    rotations_rad = 2.0 * np.arcsin(q_norm)
+    rotations_deg_total = rotations_rad * (180.0 / np.pi)
+
+    # Approximation for individual axes stats (useful for mean/std logging)
+    rotations_deg_axes = quats * 2.0 * (180.0 / np.pi)
 
     max_disp = float(np.linalg.norm(translations_mm, axis=1).max())
     if len(translations_mm) > 1:
@@ -396,9 +407,9 @@ def compute_head_movement_stats(head_pos: Optional[np.ndarray]) -> Optional[Dict
     else:
         total_disp = 0.0
 
-    max_rot = float(np.linalg.norm(rotations_deg, axis=1).max())
-    if len(rotations_deg) > 1:
-        step_rot = np.linalg.norm(np.diff(rotations_deg, axis=0), axis=1)
+    max_rot = float(np.abs(rotations_deg_total).max())
+    if len(rotations_deg_total) > 1:
+        step_rot = np.abs(np.diff(rotations_deg_total, axis=0))
         total_rot = float(step_rot.sum())
     else:
         total_rot = 0.0
@@ -413,14 +424,13 @@ def compute_head_movement_stats(head_pos: Optional[np.ndarray]) -> Optional[Dict
             "total_movement": total_disp,
         },
         "rotation_stats_deg": {
-            "mean": [float(x) for x in rotations_deg.mean(axis=0)],
-            "std": [float(x) for x in rotations_deg.std(axis=0)],
+            "mean": [float(x) for x in rotations_deg_axes.mean(axis=0)],
+            "std": [float(x) for x in rotations_deg_axes.std(axis=0)],
             "max_rotation": max_rot,
             "total_rotation": total_rot,
         },
     }
     return stats
-
 
 def plot_head_movement(
     head_pos_array: Optional[np.ndarray],
@@ -445,8 +455,8 @@ def plot_head_movement(
 
     hp = np.asarray(head_pos_array, float)
     t = hp[:, 0]
-    x, y, z = hp[:, 1:4].T * 1000.0
-    rot = hp[:, 4:7] * (180.0 / np.pi)
+    rot = hp[:, 1:4] * 2.0 * (180.0 / np.pi)  # Quaternions approx to degrees
+    x, y, z = hp[:, 4:7].T * 1000.0  # Translations (meters -> mm)
 
     fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
     axes[0].plot(t, x, label="X")
@@ -478,9 +488,9 @@ def plot_head_movement(
 # ---------------------------------------------------------------------------
 
 def compute_destination_from_pos(
-    head_pos: Optional[np.ndarray],
-    strategy: str = "median",
-    logger: Optional[logging.Logger] = None,
+        head_pos: Optional[np.ndarray],
+        strategy: str = "median",
+        logger: Optional[logging.Logger] = None,
 ) -> Optional[np.ndarray]:
     """Compute a static destination pose from head-pos data.
 
@@ -488,7 +498,7 @@ def compute_destination_from_pos(
     ----------
     head_pos : np.ndarray or None
         Aligned head-pos array in ABS or REL frame. Only the translations
-        (columns 1:4) are used.
+        (columns 4:7) are used.
     strategy : {"median", "mean", "first", "last"}, default "median"
         How to pick the destination:
             - "median": robust median translation over time.
@@ -504,6 +514,7 @@ def compute_destination_from_pos(
         A 3-vector in meters (HEAD coords) or None if head_pos is None/empty
         or strategy is unrecognized.
     """
+
     def _log(msg: str) -> None:
         if logger is not None:
             logger.info(msg)
@@ -513,22 +524,25 @@ def compute_destination_from_pos(
         return None
 
     hp = np.asarray(head_pos, float)
-    if hp.shape[1] < 4:
+    # FIX: Ensure we have at least 7 columns to access the translations (4:7)
+    if hp.shape[1] < 7:
         _log(
             f"compute_destination_from_pos: head_pos has shape {hp.shape}; "
-            "need at least columns 1:4 for translations → destination=None."
+            "need at least columns 4:7 for translations → destination=None."
         )
         return None
 
     strategy = strategy.lower()
+
+    # FIX: Corrected all indices from 1:4 (quaternions) to 4:7 (translations)
     if strategy == "median":
-        dest = np.median(hp[:, 1:4], axis=0)
+        dest = np.median(hp[:, 4:7], axis=0)
     elif strategy == "mean":
-        dest = hp[:, 1:4].mean(axis=0)
+        dest = hp[:, 4:7].mean(axis=0)
     elif strategy == "first":
-        dest = hp[0, 1:4]
+        dest = hp[0, 4:7]
     elif strategy == "last":
-        dest = hp[-1, 1:4]
+        dest = hp[-1, 4:7]
     else:
         _log(f"compute_destination_from_pos: unknown strategy '{strategy}' → destination=None.")
         return None

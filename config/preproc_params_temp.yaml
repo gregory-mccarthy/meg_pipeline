@@ -1,33 +1,45 @@
 # ============================================================
-# MEG/EEG Preprocessing Configuration - Local, Auto Stage1→Stage2
+# MEG/EEG Preprocessing Configuration - Local Processing Mode
+# ============================================================
+# Local workflow: data already available on this machine.
+# No remote fetch/push. Single-machine processing.
 # ============================================================
 
-# This is a test dataset for MNS analysis created on 11/04/2025
+# Example raw file:
+# /Users/gm33/data/faces/sub-004/ses-01/meg/sub-004_ses-01_task-temphierarchy_run-01_meg.fif
 
 # ============================================================
 # BIDS DATASET IDENTIFIERS
 # ============================================================
-subject: "020"
+subject: "004"
 session: "01"
 run: "01"
-task: "mns"
-bids_root: "/Users/gm33/data/bids-test"
+task: "temphierarchy"
+
+# Local BIDS root (edit this)
+bids_root: /Users/gm33/data/faces
+
+# If you want to analyze a subset of the recording, uncomment:
+# time_window:
+#   start: null   # e.g., "20:00" (20 min), 1200, or null to start at 0 s
+#   end:   null   # e.g., "30:00" (30 min), 1800, or null to go to recording end
 
 # ============================================================
-# HYBRID / REMOTE I/O (disabled for local run)
+# LOCAL PROCESSING I/O (REMOTE DISABLED)
 # ============================================================
 remote_io:
   enabled: false
-  hpc_host: transfer-milgram.ycrc.yale.edu
-  hpc_user: gm33
-  remote_bids_root: /gpfs/milgram/pi/nobre/meg_shared/fairy/bids
+  hpc_host: null
+  hpc_user: null
+  remote_bids_root: null
   local_temp_dir: ./temp
 
 # ============================================================
 # MAXWELL FILTERING (tSSS) CALIBRATION
 # ============================================================
-calibration_file: /Users/gm33/meg_pipeline/cals/sss_cal_factory_20230619.dat
-cross_talk_file: /Users/gm33/meg_pipeline/cals/ct_sparse_triux2.fif
+# These can be relative to your project root, or absolute paths.
+calibration_file: /Users/gm33/data/cals/sss_cal_factory_20230619.dat
+cross_talk_file: /Users/gm33/data/cals/ct_sparse_triux2.fif
 
 # ============================================================
 # BASIC SIGNAL PROCESSING
@@ -55,13 +67,13 @@ triggers:
 # EEG MONTAGE CONFIGURATION
 # ============================================================
 eeg_handling:
-  montage: /Users/gm33/meg_pipeline/montage/EasyCap_53.sfp
+  montage: null
 
 # ============================================================
 # INTERACTIVE PROCESSING CONTROLS
-# (disabled for full automatic run)
 # ============================================================
 interactive_bad_channels: true
+interactive_ica: true
 
 # ============================================================
 # MANUAL OVERRIDES
@@ -84,7 +96,7 @@ autoreject:
     duration: 2.0
     tmin: 0.0
     tmax: 2.0
-  cv_folds: 5
+  cv_folds: 7
   thresh_method: "random_search"
   # thresh_method: "bayesian_optimization"
   n_interpolate: [0]
@@ -94,7 +106,6 @@ autoreject:
 
 # ============================================================
 # INDEPENDENT COMPONENT ANALYSIS (ICA)
-# (interactive flags off to avoid pauses)
 # ============================================================
 ica_preprocessing:
   eeg:
@@ -126,12 +137,11 @@ final_filter:
 
 # ============================================================
 # CHECKPOINT AND RESUME SYSTEM
-# (keeps running through; no exit after checkpoint)
 # ============================================================
 checkpoint:
   enabled: true
   exit_after_checkpoint: false
-  derivatives_root: "/Users/gm33/data/bids-test/derivatives"
+  derivatives_root: derivatives
   pipeline_name: preprocessing
   atomic_writes: true
   allow_resume_with_different_yaml: true
@@ -154,3 +164,4 @@ metadata_fixes:
   fix_generic: {}
   expert_patch: |
     print("✅ Expert patch executed successfully.")
+    
