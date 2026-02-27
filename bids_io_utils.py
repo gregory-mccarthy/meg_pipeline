@@ -317,25 +317,47 @@ def list_all_split_files(first_file: Union[str, Path]) -> List[Path]:
     parent = first_file.parent
     name = first_file.name
 
-    if name.endswith(_SPLIT01) or re.search(_SPLIT_RE, name):
-        base = re.sub(_SPLIT_RE, "_split-", name)
-        base = base[:-len("split-")] if base.endswith("split-") else base[:-len("_split-")]
-        files = sorted(parent.glob(f"{base}{_SPLITALL}"))
-        return [f.resolve() for f in files]
+    # Helper to sort files naturally based on the split integer
+    def extract_split_num(p: Path) -> int:
+        nm = p.name
+        # Check BIDS split format
+        m_bids = re.search(r"_split-(\d+)_meg\.fif$", nm)
+        if m_bids:
+            return int(m_bids.group(1))
 
-    if name.endswith(_MEGBAS):
-        base = name[:-len(_MEGBAS)]
-        files = [first_file] + sorted(parent.glob(f"{base}_meg-*.fif"))
-        return [f.resolve() for f in files]
+        # Check MEGIN split format
+        m_megin = re.search(r"_meg-(\d+)\.fif$", nm)
+        if m_megin:
+            return int(m_megin.group(1))
 
-    if re.search(_MEGNUM, name):
-        base = re.sub(_MEGNUM, "", name)
+        # Base file is always first chronologically
+        if nm.endswith("_meg.fif") and not "_split-" in nm:
+            return 0
+
+        return 9999
+
+    # Case 1: BIDS standard (e.g., _split-01_meg.fif)
+    if name.endswith("_split-01_meg.fif") or re.search(r"_split-(\d+)_meg\.fif$", name):
+        # Cleanly strip the entire split suffix to get the exact base
+        base = re.sub(r"_split-(\d+)_meg\.fif$", "", name)
+        files = list(parent.glob(f"{base}_split-*_meg.fif"))
+        return sorted([f.resolve() for f in files], key=extract_split_num)
+
+    # Case 2 & 3: MEGIN base (_meg.fif) or continuation (_meg-1.fif)
+    if name.endswith("_meg.fif") or re.search(r"_meg-(\d+)\.fif$", name):
+        # Strip both possible MEGIN suffixes to find the base stem
+        base = re.sub(r"_meg(?:-\d+)?\.fif$", "", name)
+
         candidates = []
-        single = parent / f"{base}{_MEGBAS}"
+        single = parent / f"{base}_meg.fif"
         if single.exists():
             candidates.append(single)
-        candidates.extend(sorted(parent.glob(f"{base}_meg-*.fif")))
-        return [f.resolve() for f in candidates]
+
+        # Grab all numbered continuations
+        candidates.extend(list(parent.glob(f"{base}_meg-*.fif")))
+
+        # Sort chronologically by the split integer
+        return sorted([c.resolve() for c in candidates], key=extract_split_num)
 
     return [first_file]
 
@@ -358,7 +380,8 @@ def discover_runs(bids_root: Union[str, Path],
     stem_norun = build_bids_stem(subject, session, task, run=None)
     runs = set()
     for p in meg_dir.glob(f"{stem_norun}_run-*_meg*.fif"):
-        m = re.search(r"_run-([A-Za-z0-9]+)_meg", p.name)
+        # UPDATED REGEX: Safely extracts the run number before `_split` or `_meg`
+        m = re.search(r"_run-([A-Za-z0-9]+)_", p.name)
         if m:
             runs.add(norm_run(m.group(1)) or m.group(1))
     out = sorted(runs)
@@ -432,17 +455,23 @@ def find_first_file_for_run(bids_root: Union[str, Path],
                 f"{sorted(found_runs)}. Specify e.g., run: '01'."
             )
 
-    # Rank first file: split-01 > meg-1 > single
+    # Rank first file prioritizing correctly for both BIDS and MEGIN standards
     def _rank_first_file(p: Path) -> int:
         name = p.name
+        # 1. BIDS standard first file
         if name.endswith("_split-01_meg.fif"):
             return 0
+
+        # 2. MEGIN standard first file (base file)
+        if name.endswith("_meg.fif") and not "_split-" in name:
+            return 1
+
+        # 3. MEGIN continuation files (should not be picked as 'first')
         m = re.search(r"_meg-(\d+)\.fif$", name)
         if m:
             n = int(m.group(1))
-            return 1 + min(n, 9998)
-        if name.endswith("_meg.fif"):
-            return 10000
+            return 10 + min(n, 9998)
+
         return 20000
 
     candidates.sort(key=_rank_first_file)

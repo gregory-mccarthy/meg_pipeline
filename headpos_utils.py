@@ -386,30 +386,34 @@ def compute_head_movement_stats(head_pos: Optional[np.ndarray]) -> Optional[Dict
     if hp.shape[1] < 7:
         raise ValueError(f"head_pos must have at least 7 columns for movement stats; got {hp.shape}.")
 
-    # FIX: Corrected column indices
     quats = hp[:, 1:4]  # Quaternions
     translations_mm = hp[:, 4:7] * 1000.0  # Translations (meters -> mm)
 
-    # Convert quaternions to approximate rotation angles (degrees)
-    # Magnitude of the quaternion vector (q1, q2, q3) is sin(theta/2)
-    q_norm = np.linalg.norm(quats, axis=1)
-    q_norm = np.clip(q_norm, -1.0, 1.0)  # Prevent arcsin NaNs
-    rotations_rad = 2.0 * np.arcsin(q_norm)
-    rotations_deg_total = rotations_rad * (180.0 / np.pi)
+    # 1. Calculate relative translations (from the starting position of this run)
+    rel_translations_mm = translations_mm - translations_mm[0]
 
-    # Approximation for individual axes stats (useful for mean/std logging)
-    rotations_deg_axes = quats * 2.0 * (180.0 / np.pi)
+    # Calculate max relative displacement (magnitude of the relative translation vector)
+    max_disp = float(np.linalg.norm(rel_translations_mm, axis=1).max())
 
-    max_disp = float(np.linalg.norm(translations_mm, axis=1).max())
+    # Calculate step-by-step cumulative displacement
     if len(translations_mm) > 1:
         step_disp = np.linalg.norm(np.diff(translations_mm, axis=0), axis=1)
         total_disp = float(step_disp.sum())
     else:
         total_disp = 0.0
 
-    max_rot = float(np.abs(rotations_deg_total).max())
-    if len(rotations_deg_total) > 1:
-        step_rot = np.abs(np.diff(rotations_deg_total, axis=0))
+    # 2. Convert quaternions to approximate rotation angles (degrees) for individual axes
+    rotations_deg_axes = quats * 2.0 * (180.0 / np.pi)
+
+    # Calculate relative rotations (from the starting orientation of this run)
+    rel_rotations_deg_axes = rotations_deg_axes - rotations_deg_axes[0]
+
+    # Calculate max relative rotation (magnitude of the relative rotation vector)
+    max_rot = float(np.linalg.norm(rel_rotations_deg_axes, axis=1).max())
+
+    # Calculate step-by-step cumulative rotation
+    if len(rotations_deg_axes) > 1:
+        step_rot = np.linalg.norm(np.diff(rotations_deg_axes, axis=0), axis=1)
         total_rot = float(step_rot.sum())
     else:
         total_rot = 0.0
@@ -420,25 +424,26 @@ def compute_head_movement_stats(head_pos: Optional[np.ndarray]) -> Optional[Dict
         "translation_stats_mm": {
             "mean": [float(x) for x in translations_mm.mean(axis=0)],
             "std": [float(x) for x in translations_mm.std(axis=0)],
-            "max_displacement": max_disp,
+            "max_displacement": max_disp,  # Now relative to start
             "total_movement": total_disp,
         },
         "rotation_stats_deg": {
             "mean": [float(x) for x in rotations_deg_axes.mean(axis=0)],
             "std": [float(x) for x in rotations_deg_axes.std(axis=0)],
-            "max_rotation": max_rot,
+            "max_rotation": max_rot,  # Now relative to start
             "total_rotation": total_rot,
         },
     }
     return stats
 
+
 def plot_head_movement(
-    head_pos_array: Optional[np.ndarray],
-    plots_dir: str,
-    fname: str = "head_movement_over_time.png",
-    logger: Optional[logging.Logger] = None,
+        head_pos_array: Optional[np.ndarray],
+        plots_dir: str,
+        fname: str = "head_movement_over_time.png",
+        logger: Optional[logging.Logger] = None,
 ) -> None:
-    """Plot translation (mm) and rotation (deg) over time from a head_pos array."""
+    """Plot relative translation (mm) and rotation (deg) over time from a head_pos array."""
     import matplotlib.pyplot as plt
 
     def _log_warn(msg: str) -> None:
@@ -455,24 +460,31 @@ def plot_head_movement(
 
     hp = np.asarray(head_pos_array, float)
     t = hp[:, 0]
+
+    # Calculate relative rotation (zeroed at start)
     rot = hp[:, 1:4] * 2.0 * (180.0 / np.pi)  # Quaternions approx to degrees
-    x, y, z = hp[:, 4:7].T * 1000.0  # Translations (meters -> mm)
+    rot = rot - rot[0]
+
+    # Calculate relative translation (zeroed at start)
+    translations = hp[:, 4:7] * 1000.0  # Translations (meters -> mm)
+    translations = translations - translations[0]
+    x, y, z = translations.T
 
     fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
     axes[0].plot(t, x, label="X")
     axes[0].plot(t, y, label="Y")
     axes[0].plot(t, z, label="Z")
-    axes[0].set_ylabel("Translation (mm)")
+    axes[0].set_ylabel("Relative Translation (mm)")
     axes[0].legend()
-    axes[0].set_title("Head Translation Over Time")
+    axes[0].set_title("Head Translation Relative to Start")
 
     axes[1].plot(t, rot[:, 0], label="X rot")
     axes[1].plot(t, rot[:, 1], label="Y rot")
     axes[1].plot(t, rot[:, 2], label="Z rot")
-    axes[1].set_ylabel("Rotation (deg)")
+    axes[1].set_ylabel("Relative Rotation (deg)")
     axes[1].set_xlabel("Time (s)")
     axes[1].legend()
-    axes[1].set_title("Head Rotation Over Time")
+    axes[1].set_title("Head Rotation Relative to Start")
 
     os.makedirs(plots_dir, exist_ok=True)
     out_path = os.path.join(plots_dir, fname)
@@ -481,7 +493,6 @@ def plot_head_movement(
     plt.close(fig)
 
     _log_info(f"Head movement plot saved to {out_path}")
-
 
 # ---------------------------------------------------------------------------
 # Destination pose (static reference for movement comp)
