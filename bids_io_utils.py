@@ -585,9 +585,8 @@ def _infer_entities_from_raw(raw) -> Dict[str, Optional[str]]:
             pass
     return entities
 
-
 def write_bids_robust(raw: mne.io.BaseRaw,
-                      bids_root: Union[str, Path],
+                      bids_root_or_path: Union[str, Path, "mne_bids.BIDSPath", Dict[str, str]],
                       subject: Optional[str] = None,
                       session: Optional[str] = None,
                       task: Optional[str] = None,
@@ -601,33 +600,54 @@ def write_bids_robust(raw: mne.io.BaseRaw,
     Entities can be omitted; if so we attempt to infer them from raw.filenames[0]
     (or similar) using parse_meg_fname(). Any explicitly provided entity wins.
     """
-    bids_root = Path(bids_root)
+
+    # 1) Smart path detection: If passed a BIDSPath object, it already contains
+    # the exact target filename (including custom descriptions like 'desc-preproc').
+    if hasattr(bids_root_or_path, "fpath") and getattr(bids_root_or_path, "fpath") is not None:
+        out = Path(bids_root_or_path.fpath)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if out.exists() and not overwrite:
+            raise FileExistsError(f"File exists: {out}")
+        raw.save(str(out), overwrite=overwrite, **kwargs)
+        return out
+
+    # 2) If passed a root path or dict, fall back to standard construction
+    bids_root: Optional[Path] = None
+    if isinstance(bids_root_or_path, dict):
+        d = bids_root_or_path
+        bids_root = Path(d.get("root") or d.get("bids_root") or ".")
+        subject = subject if subject is not None else d.get("subject")
+        session = session if session is not None else d.get("session")
+        task = task if task is not None else d.get("task")
+        run = run if run is not None else d.get("run")
+    else:
+        bids_root = Path(bids_root_or_path)
+
     bids_root.mkdir(parents=True, exist_ok=True)
 
-    # 1) Infer missing entities from the raw’s original filename, if possible
+    # 3) Infer missing entities from the raw’s original filename, if possible
     if subject is None or session is None or task is None or run is None:
         inferred = _infer_entities_from_raw(raw)
         subject = subject if subject is not None else inferred.get("subject")
         session = session if session is not None else inferred.get("session")
-        task    = task    if task    is not None else inferred.get("task")
-        run     = run     if run     is not None else inferred.get("run")
+        task = task if task is not None else inferred.get("task")
+        run = run if run is not None else inferred.get("run")
 
-    # 2) Normalize entities (tolerant input, canonical output)
-    s  = norm_subject(subject)
+    # 4) Normalize entities (tolerant input, canonical output)
+    s = norm_subject(subject)
     se = norm_session(session)
-    r  = norm_run(run)
-    # task is free text; leave as-is except None-like
-    t  = None if _none_like(task) else str(task)
+    r = norm_run(run)
+    t = None if _none_like(task) else str(task)
 
-    # 3) Resolve MEG directory (fault-tolerant to on-disk padding); create if needed
+    # 5) Resolve MEG directory (fault-tolerant to on-disk padding); create if needed
     meg_dir = resolve_meg_dir(bids_root, s, se)
     meg_dir.mkdir(parents=True, exist_ok=True)
 
-    # 4) Build canonical stem and output path
+    # 6) Build canonical stem and output path
     stem = build_bids_stem(s, se, t, r)
     out = meg_dir / f"{stem}_meg.fif"
 
-    # 5) Write
+    # 7) Write
     if out.exists() and not overwrite:
         raise FileExistsError(f"File exists: {out}")
     raw.save(str(out), overwrite=overwrite, **kwargs)

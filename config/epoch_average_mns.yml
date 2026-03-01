@@ -1,0 +1,62 @@
+# ==== BIDS & run list ====
+bids_root: "/Users/gm33/data/epi"
+
+inputs:
+  - subject: "013"
+    session: "01"
+    task: "mns"
+    run: "01"
+
+# ==== Outputs (single block!) ====
+outputs:
+  save_evokeds: true
+  save_epochs: true
+  evokeds_subdir: "derivatives/avg"
+  epochs_subdir: "derivatives/epochs"
+  combined_evokeds: true        # write single all-in-one -ave.fif
+  combined_desc: "all"          # controls desc-<...> in the filename
+
+# Read ONLY the derivative file:
+derivatives_subdir: "derivatives/preprocessing"
+derivatives_desc: "preproc"
+
+# === Event source and timing correction ===
+events:
+  source: "annot_timing_stim_codes"
+  base: "rel"
+  tolerance_sec: 0.002
+  regex: "TRIG/(\\d+)"
+  offset_ms: 0
+  # If you truly want a -75 ms global shift, set samples instead (example at 1000 Hz):
+  # alignment_correction_samples: -75
+  verify_against_stim: true
+  notes: "Triggers written at time zero."
+
+# ==== Global defaults ====
+stim_channel: "STI101"
+
+tmin: -0.1
+tmax: 0.5
+baseline: [null, 0.0]
+
+use_reject: false
+reject:
+  mag: 4e-12
+  grad: 4000e-13
+  eeg: 100e-6
+
+filter:
+  l_freq: null
+  h_freq: null
+
+artifact_suppression: { window: null }
+
+conditions:
+  LMN:
+    expr: "val == 16384"
+  RMN:
+    expr: "val == 32768"
+
+epoch_windows:
+ LMN: { tmin: -0.1, tmax: 0.5 }
+ RMN: { tmin: -0.1, tmax: 0.5 }
