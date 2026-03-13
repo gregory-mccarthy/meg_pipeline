@@ -17,13 +17,11 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import mne
+import pandas as pd
 
 # =============================================================================
 # Basic utilities and normalization
 # =============================================================================
-
-def _none_like(x) -> bool:
-    return x in (None, "", False, "None", "null", "NULL")
 
 def _strip_entity_prefix(s: str) -> str:
     for p in ("sub-", "ses-", "run-", "split-"):
@@ -60,7 +58,26 @@ def _ent(stem: str, key: str, val: Optional[str]) -> str:
 # ####################################################
 
 def _none_like(val) -> bool:
-    return val is None or (isinstance(val, str) and val.strip().lower() in {"", "none", "null"})
+    return val is None or val is False or (isinstance(val, str) and val.strip().lower() in {"", "none", "null"})
+
+def _strip_string(val) -> Optional[str]:
+    if _none_like(val):
+        return None
+    return str(val).strip()
+
+def norm_task(val) -> Optional[str]:
+    return _strip_string(val)
+
+def sanitize_bids_entities(subject=None,
+                           session=None,
+                           task=None,
+                           run=None) -> Dict[str, Optional[str]]:
+    return {
+        "subject": norm_subject(subject),
+        "session": norm_session(session),
+        "task": norm_task(task),
+        "run": norm_run(run),
+    }
 
 def _parse_hms_or_float(val):
     """Return seconds (float) from 'hh:mm:ss' | 'mm:ss' | float/int | None."""
@@ -190,12 +207,14 @@ def build_bids_stem(subject: str,
     """
     Return canonical BIDS stem 'sub-XXX[_ses-YY][_task-ZZ][_run-WW]'.
     """
-    s  = norm_subject(subject)
-    se = norm_session(session)
-    r  = norm_run(run)
+    ent = sanitize_bids_entities(subject=subject, session=session, task=task, run=run)
+    s = ent["subject"]
+    se = ent["session"]
+    t = ent["task"]
+    r = ent["run"]
     stem = f"sub-{s}"
     stem = _ent(stem, "ses", se)
-    stem = _ent(stem, "task", task if not _none_like(task) else None)
+    stem = _ent(stem, "task", t)
     stem = _ent(stem, "run", r)
     return stem
 
@@ -210,16 +229,18 @@ def resolve_meg_dir(bids_root: Union[str, Path],
     (e.g., sub-1 == sub-01 == sub-001; ses-1 == ses-01). If none exists, return
     the canonical path (so writers emit a consistent form).
     """
-    bids_root = Path(bids_root)
+    bids_root = Path(str(bids_root).strip())
+    ent = sanitize_bids_entities(subject=subject, session=session)
+    subject = ent["subject"]
+    session = ent["session"]
+
     found = _find_existing_meg_dir(bids_root, subject, session)
     if found is not None:
         return found
 
-    s  = norm_subject(subject)
-    se = norm_session(session)
-    parts = [bids_root, f"sub-{s}"]
-    if not _none_like(se):
-        parts.append(f"ses-{se}")
+    parts = [bids_root, f"sub-{subject}"]
+    if not _none_like(session):
+        parts.append(f"ses-{session}")
     parts.append("meg")
     return Path(*parts)
 
@@ -259,19 +280,21 @@ def ensure_derivatives_dir(deriv_root: Union[str, Path],
       - Otherwise, create and return the canonical path:
             deriv_root/sub-<norm_subject>/[ses-<norm_session>]
     """
-    deriv_root = Path(deriv_root)
+    deriv_root = Path(str(deriv_root).strip())
     deriv_root.mkdir(parents=True, exist_ok=True)
+
+    ent = sanitize_bids_entities(subject=subject, session=session)
+    subject = ent["subject"]
+    session = ent["session"]
 
     found = _find_existing_deriv_sub_ses(deriv_root, subject, session)
     if found is not None:
         found.mkdir(parents=True, exist_ok=True)
         return found
 
-    s  = norm_subject(subject)   # 3-digit
-    se = norm_session(session)   # 2-digit
-    out = deriv_root / f"sub-{s}"
-    if not _none_like(se):
-        out = out / f"ses-{se}"
+    out = deriv_root / f"sub-{subject}"
+    if not _none_like(session):
+        out = out / f"ses-{session}"
     out.mkdir(parents=True, exist_ok=True)
     return out
 
@@ -288,13 +311,13 @@ def make_derivative_path(bids_root: Union[str, Path],
         svg  = make_derivative_path(bids_root, "meg-preproc-v1", subject, session,
                                     ["figures", f"{stem}_ica_qc.svg"])
     """
-    root = Path(bids_root) / "derivatives"
+    root = Path(str(bids_root).strip()) / "derivatives"
     if pipeline_name:
-        root = root / pipeline_name
+        root = root / str(pipeline_name).strip()
     sub_ses_dir = ensure_derivatives_dir(root, subject, session)
     out = sub_ses_dir
     for p in relative_parts:
-        out = out / p
+        out = out / str(p).strip()
     out.parent.mkdir(parents=True, exist_ok=True)
     return out
 
@@ -508,27 +531,43 @@ def read_raw_bids_smart(
       info: dict(style, first_file, all_matches)
     """
     bids_root: Optional[Path] = None
-    if hasattr(bids_root_or_path, "root"):
-        bp = bids_root_or_path
-        bids_root = Path(bp.root)
-        subject = getattr(bp, "subject", subject)
-        session = getattr(bp, "session", session)
-        task = getattr(bp, "task", task)
-        run = getattr(bp, "run", run)
+
+    # IMPORTANT: pathlib.Path also has a .root attribute, so plain path-like
+    # inputs must be handled before any BIDSPath-like dispatch.
+    if isinstance(bids_root_or_path, (str, Path)):
+        bids_root = Path(str(bids_root_or_path).strip())
+
     elif isinstance(bids_root_or_path, dict):
         d = bids_root_or_path
-        bids_root = Path(d.get("root") or d.get("bids_root") or ".")
+        bids_root = Path(str(d.get("root") or d.get("bids_root") or ".").strip())
         subject = d.get("subject", subject)
         session = d.get("session", session)
         task = d.get("task", task)
         run = d.get("run", run)
+
+    elif (
+        hasattr(bids_root_or_path, "root")
+        and hasattr(bids_root_or_path, "subject")
+        and hasattr(bids_root_or_path, "task")
+    ):
+        bp = bids_root_or_path
+        bids_root = Path(str(bp.root).strip())
+        subject = getattr(bp, "subject", subject)
+        session = getattr(bp, "session", session)
+        task = getattr(bp, "task", task)
+        run = getattr(bp, "run", run)
+
     else:
-        bids_root = Path(bids_root_or_path)
+        raise TypeError(
+            "bids_root_or_path must be a path-like root, dict, or BIDSPath-like object"
+        )
 
     # Canonicalize (we still do tolerant probing later)
-    subject = norm_subject(subject)
-    session = norm_session(session)
-    run = norm_run(run)
+    ent = sanitize_bids_entities(subject=subject, session=session, task=task, run=run)
+    subject = ent["subject"]
+    session = ent["session"]
+    task = ent["task"]
+    run = ent["run"]
 
     first, style, candidates = find_first_file_for_run(
         bids_root=bids_root,
@@ -601,11 +640,30 @@ def write_bids_robust(raw: mne.io.BaseRaw,
     (or similar) using parse_meg_fname(). Any explicitly provided entity wins.
     """
 
-    # 1) Smart path detection: If passed a BIDSPath object, it already contains
-    # the exact target filename (including custom descriptions like 'desc-preproc').
+    # 1) Smart path detection: if passed a BIDSPath object, sanitize the entities
+    # before reconstructing the output path. This defends against stray whitespace
+    # in YAML-derived entities that may already have contaminated bp.fpath.
     if hasattr(bids_root_or_path, "fpath") and getattr(bids_root_or_path, "fpath") is not None:
-        out = Path(bids_root_or_path.fpath)
-        out.parent.mkdir(parents=True, exist_ok=True)
+        bp = bids_root_or_path
+        ent = sanitize_bids_entities(
+            subject=getattr(bp, "subject", subject),
+            session=getattr(bp, "session", session),
+            task=getattr(bp, "task", task),
+            run=getattr(bp, "run", run),
+        )
+        desc = _strip_string(getattr(bp, "description", None))
+        suffix = _strip_string(getattr(bp, "suffix", None)) or "meg"
+        extension = _strip_string(getattr(bp, "extension", None)) or ".fif"
+        bids_root = Path(str(getattr(bp, "root")).strip())
+
+        meg_dir = resolve_meg_dir(bids_root, ent["subject"], ent["session"])
+        meg_dir.mkdir(parents=True, exist_ok=True)
+
+        stem = build_bids_stem(ent["subject"], ent["session"], ent["task"], ent["run"])
+        if not _none_like(desc):
+            stem = f"{stem}_desc-{desc}"
+        out = meg_dir / f"{stem}_{suffix}{extension}"
+
         if out.exists() and not overwrite:
             raise FileExistsError(f"File exists: {out}")
         raw.save(str(out), overwrite=overwrite, **kwargs)
@@ -615,13 +673,13 @@ def write_bids_robust(raw: mne.io.BaseRaw,
     bids_root: Optional[Path] = None
     if isinstance(bids_root_or_path, dict):
         d = bids_root_or_path
-        bids_root = Path(d.get("root") or d.get("bids_root") or ".")
+        bids_root = Path(str(d.get("root") or d.get("bids_root") or ".").strip())
         subject = subject if subject is not None else d.get("subject")
         session = session if session is not None else d.get("session")
         task = task if task is not None else d.get("task")
         run = run if run is not None else d.get("run")
     else:
-        bids_root = Path(bids_root_or_path)
+        bids_root = Path(str(bids_root_or_path).strip())
 
     bids_root.mkdir(parents=True, exist_ok=True)
 
@@ -634,10 +692,11 @@ def write_bids_robust(raw: mne.io.BaseRaw,
         run = run if run is not None else inferred.get("run")
 
     # 4) Normalize entities (tolerant input, canonical output)
-    s = norm_subject(subject)
-    se = norm_session(session)
-    r = norm_run(run)
-    t = None if _none_like(task) else str(task)
+    ent = sanitize_bids_entities(subject=subject, session=session, task=task, run=run)
+    s = ent["subject"]
+    se = ent["session"]
+    r = ent["run"]
+    t = ent["task"]
 
     # 5) Resolve MEG directory (fault-tolerant to on-disk padding); create if needed
     meg_dir = resolve_meg_dir(bids_root, s, se)
@@ -673,11 +732,13 @@ def get_bids_headpos_path(subject: str,
                           run: Optional[str],
                           bids_root: Union[str, Path]) -> Path:
     """Return the expected path for MaxFilter head position text file alongside FIF."""
-    s  = norm_subject(subject)
-    se = norm_session(session)
-    r  = norm_run(run)
-    stem = build_bids_stem(s, se, task, r)
-    meg_dir = resolve_meg_dir(bids_root, s, se)
+    ent = sanitize_bids_entities(subject=subject, session=session, task=task, run=run)
+    s = ent["subject"]
+    se = ent["session"]
+    t = ent["task"]
+    r = ent["run"]
+    stem = build_bids_stem(s, se, t, r)
+    meg_dir = resolve_meg_dir(Path(str(bids_root).strip()), s, se)
     return meg_dir / f"{stem}_headpos.txt"
 
 def _rsync_cmd(base_args: Iterable[str]) -> List[str]:
@@ -691,18 +752,20 @@ def fetch_bids_data_and_sidecars(hpc_host: str, hpc_user: str,
                                  task: Optional[str],
                                  run: Optional[str]) -> None:
     """Minimal fetch using rsync include rules; tolerant of run omission."""
-    s  = norm_subject(subject)
-    se = norm_session(session)
-    r  = norm_run(run)
+    ent = sanitize_bids_entities(subject=subject, session=session, task=task, run=run)
+    s = ent["subject"]
+    se = ent["session"]
+    t = ent["task"]
+    r = ent["run"]
 
-    remote = str(Path(remote_bids_root).as_posix()).rstrip("/")
-    local = Path(local_bids_root).expanduser().resolve()
+    remote = str(Path(str(remote_bids_root).strip()).as_posix()).rstrip("/")
+    local = Path(str(local_bids_root).strip()).expanduser().resolve()
 
     dpre = f"sub-{s}" + (f"/ses-{se}" if not _none_like(se) else "")
     fpre = f"sub-{s}" + (f"_ses-{se}" if not _none_like(se) else "")
 
     run_pat = f"run-{r}" if not _none_like(r) else "run-*"
-    task_pat = f"task-{task}" if not _none_like(task) else "task-*"
+    task_pat = f"task-{t}" if not _none_like(t) else "task-*"
 
     includes = [
         f"{dpre}/",
@@ -729,8 +792,8 @@ def push_bids_derivatives_rsync(local_bids_root: Union[str, Path],
                                 hpc_host: str,
                                 hpc_user: str) -> None:
     """Push local derivatives to remote using rsync. Caller chooses layout."""
-    local = Path(local_bids_root).expanduser().resolve()
-    remote = str(Path(remote_bids_root).as_posix()).rstrip("/")
+    local = Path(str(local_bids_root).strip()).expanduser().resolve()
+    remote = str(Path(str(remote_bids_root).strip()).as_posix()).rstrip("/")
     cmd = _rsync_cmd([str(local) + "/", f"{hpc_user}@{hpc_host}:{remote}"])
     subprocess.run(cmd, check=True)
 
@@ -753,7 +816,7 @@ def parse_meg_fname(name: str) -> Dict[str, Optional[str]]:
     d = m.groupdict()
     sub = norm_subject(d["sub"])
     ses = norm_session(d["ses"])
-    task = d["task"]
+    task = norm_task(d["task"])
     run = norm_run(d["run"])
     if d["bids_split"]:
         style = "bids-split"
@@ -810,4 +873,56 @@ def read_raw_bids_robust(bids_path_or_dict, **kwargs):
     Convenience wrapper around read_raw_bids_smart returning just Raw.
     """
     raw, _ = read_raw_bids_smart(bids_path_or_dict, **kwargs)
+    return raw
+
+
+def apply_bids_events_tsv(raw: mne.io.BaseRaw, fif_path: Union[str, Path], logger=None) -> mne.io.BaseRaw:
+    """
+    Looks for a companion _events.tsv file in the same directory as the raw file.
+    If found, converts the rows into MNE Annotations and attaches them to the raw object.
+    """
+    import os
+
+    base_dir = os.path.dirname(fif_path)
+    base_name = os.path.basename(fif_path)
+
+    if base_name.endswith('_meg.fif'):
+        tsv_name = base_name.replace('_meg.fif', '_events.tsv')
+    else:
+        tsv_name = base_name.replace('.fif', '_events.tsv')
+
+    tsv_path = os.path.join(base_dir, tsv_name)
+
+    if not os.path.exists(tsv_path):
+        if logger:
+            logger.info(f"[Annotations] No companion TSV found at {tsv_path}. Proceeding without it.")
+        return raw
+
+    if logger:
+        logger.info(f"[Annotations] Found companion TSV. Reading events from: {tsv_path}")
+
+    try:
+        df = pd.read_csv(tsv_path, sep='\t')
+
+        if all(col in df.columns for col in ['onset', 'duration', 'trial_type']):
+            onsets = df['onset'].values
+            durations = df['duration'].values
+            descriptions = df['trial_type'].values
+
+            annotations = mne.Annotations(onset=onsets, duration=durations, description=descriptions)
+            raw.set_annotations(annotations)
+
+            bad_count = sum('BAD' in str(desc).upper() for desc in descriptions)
+            if logger:
+                logger.info(
+                    f"[Annotations] Successfully applied {len(onsets)} annotations ({bad_count} marked as BAD).")
+        else:
+            if logger:
+                logger.warning(
+                    "[Annotations] TSV is missing required BIDS columns ('onset', 'duration', 'trial_type'). Skipping.")
+
+    except Exception as e:
+        if logger:
+            logger.error(f"[Annotations] Failed to read or apply annotations from TSV: {e}")
+
     return raw

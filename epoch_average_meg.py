@@ -31,6 +31,7 @@ Filter:
 Reject:
   - Optional reject dict; we auto-prune keys not present in the data (e.g., EEG
     thresholds omitted if no EEG channels).
+  - Optional reject_by_annotation bool (default True) to drop epochs overlapping with BAD annotations.
 
 Composites:
   - Arithmetic on Evokeds after averaging; e.g., "odd - even".
@@ -214,6 +215,29 @@ def annotate_artifacts_around_events(raw: mne.io.BaseRaw, events: np.ndarray,
     raw.set_annotations(existing + new)
 
 
+
+def blank_epochs_time_window(epochs: mne.Epochs, window_s: Tuple[float, float], mode: str = "zero") -> None:
+    """Blank a time window within each epoch (relative to event time 0).
+
+    window_s: (tmin_s, tmax_s) in seconds.
+    mode:
+      - "zero": set data to 0 in that window
+    """
+    t0, t1 = float(window_s[0]), float(window_s[1])
+    if t0 >= t1:
+        raise ValueError("artifact_suppression.window must be (start<end)")
+    if epochs._data is None:
+        raise RuntimeError("Epochs must be preloaded to blank data (use preload=True).")
+
+    mask = (epochs.times >= t0) & (epochs.times <= t1)
+    if not mask.any():
+        return
+
+    if mode == "zero":
+        epochs._data[:, :, mask] = 0.0
+    else:
+        raise ValueError(f"Unknown artifact_suppression.mode: {mode!r} (use 'zero')")
+
 def _events_from_stim(raw: mne.io.BaseRaw, stim_channel: str) -> Tuple[np.ndarray, np.ndarray]:
     events = mne.find_events(raw, stim_channel=stim_channel, shortest_event=1, initial_event=False, verbose=False)
     values = events[:, 2].astype(int)
@@ -305,8 +329,10 @@ def create_epochs_for_condition(
     global_baseline: Optional[Tuple[Optional[float], Optional[float]]],
     epoch_windows: Optional[Dict[str, Dict[str, Any]]],
     reject: Optional[Dict[str, float]],
+    reject_by_annotation: bool, # NEW
     stim_channel: Optional[str],
     artifact_suppression_window: Optional[Tuple[float, float]],
+    artifact_suppression_mode: str,
     logger: Logger,
 ) -> Tuple[Optional[mne.Epochs], Optional[mne.Evoked]]:
 
@@ -343,10 +369,6 @@ def create_epochs_for_condition(
             baseline = (None if base[0] is None else float(base[0]),
                         None if base[1] is None else float(base[1]))
 
-    # Optional artifact suppression via annotations around each event
-    if artifact_suppression_window is not None:
-        annotate_artifacts_around_events(raw, sel_events, artifact_suppression_window)
-
     # Build reject dict pruned to present channel types
     rej = None
     if reject:
@@ -362,8 +384,12 @@ def create_epochs_for_condition(
     epochs = mne.Epochs(
         raw, sel_events, event_id=None, tmin=tmin, tmax=tmax,
         baseline=baseline, preload=True, picks=picks, reject=rej,
-        detrend=None, reject_by_annotation=True, verbose=False
+        detrend=None, reject_by_annotation=reject_by_annotation, verbose=False # UPDATED
     )
+
+    if artifact_suppression_window is not None:
+        blank_epochs_time_window(epochs, artifact_suppression_window, mode=artifact_suppression_mode)
+
     evoked = epochs.average()
     logger.log("Created condition", name=cond_name, n_epochs=len(epochs), tmin=tmin, tmax=tmax, baseline=str(baseline))
     return epochs, evoked
@@ -549,6 +575,10 @@ def run_one(bids_root: Path, ent: Dict[str, str], config: Dict[str, Any], logger
         else:
             raise ValueError("artifact_suppression.window must be [start_ms, end_ms]")
 
+
+    as_mode = "zero"
+    if isinstance(as_cfg, dict) and as_cfg.get("mode") is not None:
+        as_mode = str(as_cfg["mode"]).strip().lower()
     # Conditions
     conds = config.get("conditions") or {}
     if not isinstance(conds, dict) or not conds:
@@ -562,6 +592,9 @@ def run_one(bids_root: Path, ent: Dict[str, str], config: Dict[str, Any], logger
     reject = config.get("reject") if use_reject else None
     if reject is not None and not isinstance(reject, dict):
         reject = None
+
+    # NEW: Extract annotation rejection flag
+    reject_by_ann = bool(config.get("reject_by_annotation", True))
 
     # Stim channel override at condition-level
     stim_override = config.get("stim_channel", None)
@@ -580,8 +613,10 @@ def run_one(bids_root: Path, ent: Dict[str, str], config: Dict[str, Any], logger
             global_tmin=tmin, global_tmax=tmax, global_baseline=baseline,
             epoch_windows=epoch_windows,
             reject=reject,
+            reject_by_annotation=reject_by_ann, # NEW
             stim_channel=stim_override,
             artifact_suppression_window=as_win,
+            artifact_suppression_mode=as_mode,
             logger=logger,
         )
         if ep is not None: epochs_dict[name] = ep

@@ -1689,7 +1689,7 @@ def find_bad_channels_autoreject_by_type(
             detected_bads[f"{typ}_global_bad_epochs"] = []
             continue
 
-        # Build fixed-length epochs on filtered copy
+            # Build fixed-length epochs on filtered copy
         try:
             events = mne.make_fixed_length_events(raw_filt, duration=duration)
             if events is None or len(events) == 0:
@@ -1698,12 +1698,15 @@ def find_bad_channels_autoreject_by_type(
                 detected_bads[f"{typ}_global_bad_epochs"] = []
                 continue
 
+            # --- NEW: Dynamically pull the rejection flag from your config ---
+            reject_breaks = cfg.get("annotations", {}).get("reject_bad_breaks", True) if cfg else True
+
             epochs = mne.Epochs(
                 raw_filt, events, event_id=None,
                 tmin=tmin, tmax=tmax,
                 picks=np.arange(len(ch_names)),
                 baseline=None, detrend=0, preload=True, verbose=False,
-                reject_by_annotation=True
+                reject_by_annotation=reject_breaks  # <-- Now controlled by YAML
             )
             if len(epochs) == 0:
                 logger.warning(f"Zero epochs after creation for {typ.upper()}. Skipping.")
@@ -1987,7 +1990,8 @@ def plot_head_movement(head_pos_array, plots_dir: str, fname="head_movement_over
     fig.tight_layout()
     save_plot(fig, plots_dir, fname)
 
-def run_ica(raw: mne.io.Raw, config: dict, output_path: Path, modality: str) -> tuple:
+def run_ica(raw: mne.io.Raw, config: dict, output_path: Path, modality: str,
+            reject_by_annotation: bool = True) -> tuple:
     """
     Run ICA on specified modality (EEG or MEG).
 
@@ -1996,6 +2000,7 @@ def run_ica(raw: mne.io.Raw, config: dict, output_path: Path, modality: str) -> 
         config: ICA configuration dictionary
         output_path: Path to save ICA solution
         modality: Either 'eeg' or 'meg'
+        reject_by_annotation: Whether to reject BAD_ segments during ICA fitting
 
     Returns:
         tuple: (cleaned_raw, excluded_components)
@@ -2049,13 +2054,16 @@ def run_ica(raw: mne.io.Raw, config: dict, output_path: Path, modality: str) -> 
 
     # Create and fit ICA - MNE automatically handles rank after Maxwell filtering
     ica = ICA(n_components=min(20, len(picks)), method='fastica', random_state=97)
-    ica.fit(raw_ica, picks=picks)  # No rank parameter needed
+
+    # --- NEW: Dynamically pass the rejection flag ---
+    logger.info(f"Fitting {modality.upper()} ICA. Reject by annotation: {reject_by_annotation}")
+    ica.fit(raw_ica, picks=picks, reject_by_annotation=reject_by_annotation)
 
     # Interactive component review
     interactive = config.get("interactive", True)
     if interactive:
         try:
-            #ica.plot_components(inst=raw_ica)
+            # ica.plot_components(inst=raw_ica)
             ica.plot_sources(raw_ica)
             input(f"Review {modality.upper()} ICA components. Press Enter to continue...")
         except Exception as e:
@@ -2522,3 +2530,96 @@ def get_param(cfg, key, default=None, required=False, dtype=None, choices=None):
         raise ValueError(f"Parameter '{key}' must be one of {choices}, got {val}")
 
     return val
+
+
+import os
+import logging
+import mne
+from mne_bids import BIDSPath
+
+# Assuming your other utility functions (like plot_psd_and_peaks, read_raw_bids_robust) are also in this file.
+
+logger = logging.getLogger(__name__)
+
+def compute_empty_room_cov(subject, session, bids_root, deriv_root, p, checked_paths, plots_dir):
+    """
+    Searches for an empty room recording, applies the main pipeline's filtering,
+    and computes the noise covariance matrix. Fails gracefully if no file is found.
+    """
+    logger.info("--- Checking for Empty Room Recording ---")
+
+    # 1. Auto-Discover BIDS Path
+    valid_tasks = ["noise", "emptyroom"]
+    er_bids_path = None
+
+    for task in valid_tasks:
+        search_path = BIDSPath(
+            subject=subject, session=session, task=task,
+            datatype="meg", root=bids_root
+        )
+        # Check if the file actually exists in the BIDS structure
+        if search_path.match():
+            er_bids_path = search_path
+            break
+
+    if not er_bids_path:
+        logger.warning(
+            f"No empty room recording found for sub-{subject} (tasks checked: {valid_tasks}). Skipping covariance generation.")
+        return None
+
+    logger.info(f"Found empty room recording: {er_bids_path.basename}")
+
+    # 2. Load Data
+    try:
+        raw_er = read_raw_bids_robust(er_bids_path)
+    except Exception as e:
+        logger.error(f"Failed to load empty room data: {e}")
+        return None
+
+    # 3. Apply MaxFilter (Inheriting settings from main pipeline 'p' and 'checked_paths')
+    st_duration = float(p.get("head_position_processing", {}).get("st_duration", 10.0))
+    if st_duration > raw_er.times[-1]:
+        st_duration = float(raw_er.times[-1]) if raw_er.times[-1] > 1.0 else None
+
+    maxwell_kwargs = dict(
+        calibration=str(checked_paths["calibration_file"]),
+        cross_talk=str(checked_paths["cross_talk_file"]),
+        coord_frame="meg",
+        origin=(0., 0., 0.),
+        head_pos=None,
+        destination=None,
+        st_duration=st_duration,
+        verbose=False,
+    )
+
+    logger.info("Applying MaxFilter to empty room data...")
+    raw_er = mne.preprocessing.maxwell_filter(raw_er, **maxwell_kwargs)
+
+    # 4. Apply Notch Filter (Inheriting from main pipeline 'p')
+    line_freq = float(p.get("line_freq", 60.0))
+    notch_freqs = [line_freq * i for i in range(1, 5)]
+    picks = mne.pick_types(raw_er.info, meg=True, eeg=False, exclude='bads')
+    raw_er.notch_filter(notch_freqs, picks=picks, method='fir', filter_length='auto')
+
+    # 5. Compute Covariance
+    logger.info("Computing empirical noise covariance matrix...")
+    cov = mne.compute_raw_covariance(
+        raw_er, tmin=0, tmax=None, method=['shrunk', 'empirical'],
+        picks=picks, verbose=False
+    )
+
+    # 6. Save Outputs
+    cov_filename = f"sub-{subject}_" + (f"ses-{session}_" if session else "") + "task-noise_cov.fif"
+    cov_path = os.path.join(deriv_root, cov_filename)
+
+    try:
+        mne.write_cov(cov_path, cov, overwrite=True)
+        logger.info(f"Successfully saved noise covariance matrix: {cov_path}")
+
+        # Optional: Save plots using your existing utility
+        fig_cov, _ = mne.viz.plot_cov(cov, raw_er.info, show=False)
+        fig_cov.savefig(os.path.join(plots_dir, cov_filename.replace('.fif', '.png')))
+    except Exception as e:
+        logger.error(f"Failed to save covariance matrix or plots: {e}")
+
+    return cov_path

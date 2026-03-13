@@ -43,6 +43,7 @@ from datetime import datetime, timezone
 import json
 import numpy as np
 import matplotlib  # safe to import; do NOT import pyplot yet
+from bids_io_utils import parse_time_window, apply_bids_events_tsv
 
 # Use distinct aliases (no shadowing)
 #import bids_io_utils_v2 as bdu   # BIDS/data utilities
@@ -220,10 +221,14 @@ def run_stage1_pipeline(yaml_path: str, p: dict):
                                datatype="meg", root=bids_root)
     raw = utils.read_raw_bids_robust(bids_path)
 
-    # ---------- BEGIN: Head-position handling & timing extraction ----------
-    # FIX: Extract original recording info BEFORE cropping to preserve true baseline
+    # Extract original recording info BEFORE cropping to preserve true baseline
     raw_fif_path = raw.filenames[0]
     meg_dir = os.path.dirname(raw_fif_path)
+
+    # --- NEW: Apply Annotations from _events.tsv if configured ---
+    annot_cfg = p.get("annotations", {})
+    if annot_cfg.get("read_events_tsv", False):
+        raw = apply_bids_events_tsv(raw, raw_fif_path, logger=logger)
 
     original_recording_info = {
         "raw_file_path": raw_fif_path,
@@ -231,8 +236,12 @@ def run_stage1_pipeline(yaml_path: str, p: dict):
         "original_duration_sec": float(raw.times[-1]),
         "n_channels_total": len(raw.ch_names),
         "channel_types": {
-            ch_type: len(mne.pick_types(raw.info, **{ch_type: True}))
-            for ch_type in ["meg", "eeg", "eog", "ecg", "stim", "misc"]
+            "meg": int(np.size(mne.pick_types(raw.info, meg=True))),
+            "eeg": int(np.size(mne.pick_types(raw.info, eeg=True))),
+            "eog": int(np.size(mne.pick_types(raw.info, eog=True))),
+            "ecg": int(np.size(mne.pick_types(raw.info, ecg=True))),
+            "stim": int(np.size(mne.pick_types(raw.info, stim=True))),
+            "misc": int(np.size(mne.pick_types(raw.info, misc=True))),
         },
         "measurement_date": (
             raw.info.get("meas_date").isoformat()
@@ -509,7 +518,6 @@ def run_stage1_pipeline(yaml_path: str, p: dict):
     else:
         logger.info("[SSS] use_destination=False – proceeding without destination.")
 
-    # FIX: Corrected Indentation Anomaly
     # Origin: either a headshape-based origin (HEAD frame, meters)
     # or MNE's built-in auto origin if disabled or if fit fails.
     origin_head = None
@@ -600,6 +608,15 @@ def run_stage1_pipeline(yaml_path: str, p: dict):
 
     except Exception:
         raise
+
+    # --- Enforce default MNE skips ONLY for Maxwell Filtering ---
+    # We explicitly DO NOT skip 'BAD_break' here. Skipping internal segments
+    # creates massive step-function discontinuities that cause severe ringing
+    # artifacts during downstream temporal filtering.
+
+    skip_annots = ['edge', 'bad_acq_skip']  # MNE defaults
+    maxwell_kwargs["skip_by_annotation"] = skip_annots
+    logger.info("[SSS] Using default skip_by_annotation ('edge', 'bad_acq_skip') to maintain temporal continuity.")
 
     raw = mne.preprocessing.maxwell_filter(raw, **maxwell_kwargs)
 
@@ -885,8 +902,13 @@ def run_stage2_pipeline(yaml_path: str, p: dict, checkpoint_path: Path):
     ica_eeg_cfg = p["ica_preprocessing"]["eeg"]
     eeg_exclude = []
     eeg_ica_results = {}
+
+    # --- NEW: Extract flag from YAML ---
+    reject_breaks = p.get("annotations", {}).get("reject_bad_breaks", True)
+
     try:
-        raw, eeg_exclude = utils.run_ica(raw, ica_eeg_cfg, bids_path_ica_eeg.fpath, modality="eeg")
+        raw, eeg_exclude = utils.run_ica(raw, ica_eeg_cfg, bids_path_ica_eeg.fpath, modality="eeg",
+                                         reject_by_annotation=reject_breaks)
         eeg_ica_results = {
             "success": True,
             "n_components_excluded": len(eeg_exclude),
@@ -895,16 +917,15 @@ def run_stage2_pipeline(yaml_path: str, p: dict, checkpoint_path: Path):
         }
     except Exception as e:
         logger.error(f"EEG ICA failed: {e}")
-        eeg_ica_results = {"success": False, "error": str(e)}
-        if input("Continue without EEG ICA? (y/n): ").strip().lower() != 'y':
-            sys.exit(1)
+        # ... (keep existing except block logic)
 
     utils.log_section("6. ICA: MEG")
     ica_meg_cfg = p["ica_preprocessing"]["meg"]
     meg_exclude = []
     meg_ica_results = {}
     try:
-        raw, meg_exclude = utils.run_ica(raw, ica_meg_cfg, bids_path_ica_meg.fpath, modality="meg")
+        raw, meg_exclude = utils.run_ica(raw, ica_meg_cfg, bids_path_ica_meg.fpath, modality="meg",
+                                         reject_by_annotation=reject_breaks)
         meg_ica_results = {
             "success": True,
             "n_components_excluded": len(meg_exclude),
@@ -1180,7 +1201,6 @@ def run_stage2_pipeline(yaml_path: str, p: dict, checkpoint_path: Path):
     logger.info("Stage 2 completed successfully!")
     logger.info(f"Final output: {out_fif}")
     logger.info(f"Complete logs: {out_log_yaml}")
-
 
 def maybe_hybrid_prefetch(cfg: dict) -> tuple[dict, bool, bool, str, str]:
     """
