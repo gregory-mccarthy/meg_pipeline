@@ -1,4 +1,4 @@
-# epoch_average_MEG_BIDS_phase8b.py
+# epoch_average_meg.py
 """
 Epoch averaging for MEGIN/BIDS with expression- and bit-logic bins.
 Reads ONLY preprocessed derivatives (_desc-<desc>_meg.fif).
@@ -238,9 +238,22 @@ def blank_epochs_time_window(epochs: mne.Epochs, window_s: Tuple[float, float], 
     else:
         raise ValueError(f"Unknown artifact_suppression.mode: {mode!r} (use 'zero')")
 
+
 def _events_from_stim(raw: mne.io.BaseRaw, stim_channel: str) -> Tuple[np.ndarray, np.ndarray]:
-    events = mne.find_events(raw, stim_channel=stim_channel, shortest_event=1, initial_event=False, verbose=False)
+    # Added uint_cast=True to bypass the MEGIN STI016 sign-bit bug
+    events = mne.find_events(
+        raw,
+        stim_channel=stim_channel,
+        shortest_event=1,
+        initial_event=False,
+        uint_cast=True,
+        verbose=False
+    )
     values = events[:, 2].astype(int)
+
+    # Print the exact integers MNE extracted to STDOUT for easy debugging
+    print(f"Unique trigger values extracted from {stim_channel}: {set(values)}")
+
     return events, values
 
 

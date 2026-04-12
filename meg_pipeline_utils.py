@@ -238,9 +238,13 @@ def check_critical_files_exist(cfg, repo_root):
     else:
         checked_paths["montage"] = None
 
-    # Handle required files normally
-    checked_paths["calibration_file"] = get_and_check_path(cfg, "calibration_file", repo_root, "MEG calibration file")
-    checked_paths["cross_talk_file"] = get_and_check_path(cfg, "cross_talk_file", repo_root, "MEG crosstalk file")
+    # Handle optional calibration and crosstalk files gracefully
+    for key, desc in [("calibration_file", "MEG calibration file"), ("cross_talk_file", "MEG crosstalk file")]:
+        val = cfg.get(key)
+        if val is None or str(val).strip().lower() in ["none", "null"]:
+            checked_paths[key] = None
+        else:
+            checked_paths[key] = get_and_check_path(cfg, key, repo_root, desc)
 
     return checked_paths
 

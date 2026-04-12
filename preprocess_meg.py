@@ -282,7 +282,11 @@ def run_stage1_pipeline(yaml_path: str, p: dict):
     utils.log_section("3. Compute or Load Head Position")
 
     # Head-position config from YAML
-    hpp_cfg = p.get("head_position_processing", {}) if isinstance(p, dict) else {}
+    # Prioritizes 'head_movement', falls back to 'head_position_processing'
+    if isinstance(p, dict):
+        hpp_cfg = p.get("head_movement", p.get("head_position_processing", {}))
+    else:
+        hpp_cfg = {}
 
     # Optional: derive a window tag from the global time_window for naming subset .pos
     tw = parse_time_window(p)
@@ -346,6 +350,16 @@ def run_stage1_pipeline(yaml_path: str, p: dict):
         raw,
         p.get("metadata_fixes", {}),
     )
+
+    # 5b. Mark Manual Bad Channels (CRITICAL BEFORE MAXWELL)
+    manual_bads = p.get("manual_bad_channels", [])
+    if manual_bads:
+        # Ensure we don't add duplicates
+        current_bads = set(raw.info.get('bads', []))
+        new_bads = current_bads.union(manual_bads)
+        raw.info['bads'] = list(new_bads)
+        logger.info(f"Marked manual bad channels from YAML: {manual_bads}")
+
 
     # 6. PSD & RMS Diagnostics (Pre-filtering)
     utils.log_section("6. PSD & RMS Diagnostics (Pre-filtering)")
@@ -537,12 +551,13 @@ def run_stage1_pipeline(yaml_path: str, p: dict):
         logger.info("[SSS] use_headshape_origin=False – using MNE auto origin.")
 
     maxwell_kwargs = dict(
-        calibration=str(checked_paths["calibration_file"]),
-        cross_talk=str(checked_paths["cross_talk_file"]),
+        calibration=str(checked_paths["calibration_file"]) if checked_paths.get("calibration_file") else None,
+        cross_talk=str(checked_paths["cross_talk_file"]) if checked_paths.get("cross_talk_file") else None,
         head_pos=hp,
         st_duration=st_duration,
         verbose=False,
     )
+
     if origin_head is not None:
         maxwell_kwargs["origin"] = origin_head
     if dest_arr is not None:

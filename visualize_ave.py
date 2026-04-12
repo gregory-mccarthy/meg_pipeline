@@ -182,6 +182,79 @@ def prompt_for_conditions(evokeds):
         print("Invalid selection. Please enter valid condition numbers.")
 
 
+def parse_waveform_condition_selection(cond_str, n_conditions, allow_all=False):
+    cond_str = cond_str.strip()
+
+    if allow_all and cond_str.lower() == 'all':
+        return {'mode': 'overlay', 'indices': list(range(n_conditions))}, None
+
+    tokens = [tok.strip() for tok in cond_str.split(',') if tok.strip()]
+    if not tokens:
+        return None, "Invalid selection. Please enter valid condition numbers."
+
+    try:
+        values = [int(tok) for tok in tokens]
+    except ValueError:
+        return None, "Invalid selection. Use comma-separated integers such as 1,2 or 1,-2."
+
+    if any(val == 0 for val in values):
+        return None, "Condition numbers start at 1. Zero is not valid."
+
+    has_negative = any(val < 0 for val in values)
+    if has_negative:
+        if len(values) != 2 or values[0] <= 0 or values[1] >= 0:
+            return None, (
+                "Difference mode supports exactly two entries in the form 1,-2. "
+                "Mixed selections like 1,2,-3 are not supported."
+            )
+
+        pos_idx = values[0] - 1
+        neg_idx = abs(values[1]) - 1
+        if not (0 <= pos_idx < n_conditions and 0 <= neg_idx < n_conditions):
+            return None, "Invalid selection. Please enter valid condition numbers."
+
+        return {'mode': 'difference', 'positive': pos_idx, 'negative': neg_idx}, None
+
+    indices = [val - 1 for val in values]
+    if not all(0 <= idx < n_conditions for idx in indices):
+        return None, "Invalid selection. Please enter valid condition numbers."
+
+    return {'mode': 'overlay', 'indices': indices}, None
+
+
+def build_difference_evoked(evokeds, positive_idx, negative_idx):
+    diff_evoked = mne.combine_evoked([evokeds[positive_idx], evokeds[negative_idx]], weights=[1, -1])
+    diff_evoked.comment = f"{evokeds[positive_idx].comment} - {evokeds[negative_idx].comment}"
+    return diff_evoked
+
+
+def resolve_waveform_condition_selection(evokeds, selection):
+    if selection['mode'] == 'overlay':
+        return [evokeds[idx] for idx in selection['indices']]
+
+    return [build_difference_evoked(evokeds, selection['positive'], selection['negative'])]
+
+
+def prompt_for_waveform_conditions(evokeds, allow_all=False):
+    prompt = "Enter condition numbers (e.g., 1,2 or 1,-2)"
+    if allow_all:
+        prompt += ", or 'all'"
+    prompt += ", 'c' to close plots, or 'q' to quit: "
+
+    while True:
+        cond_str = input(prompt).strip()
+        if handle_global_commands(cond_str):
+            continue
+        if cond_str.lower() == 'q':
+            return None
+
+        selection, error = parse_waveform_condition_selection(cond_str, len(evokeds), allow_all=allow_all)
+        if selection is not None:
+            return resolve_waveform_condition_selection(evokeds, selection)
+
+        print(error)
+
+
 def prompt_for_axis_limits(default_xlim_ms, default_ylim, units):
     rounded_xlim = [int(default_xlim_ms[0]), int(default_xlim_ms[1])]
     rounded_ylim = [round(default_ylim[0], 2), round(default_ylim[1], 2)]
@@ -264,8 +337,9 @@ def waveform_browser(evokeds):
     print("\n=== Waveform Browser ===")
     for i, ev in enumerate(evokeds, 1): print(f"  ({i}) {ev.comment}")
 
-    cond_indices = prompt_for_conditions(evokeds)
-    if cond_indices is None: return
+    selected_evokeds = prompt_for_waveform_conditions(evokeds)
+    if selected_evokeds is None:
+        return
 
     sensor_names = evokeds[0].ch_names
     sensor_idx = 0
@@ -288,8 +362,7 @@ def waveform_browser(evokeds):
         ylim = current_ylims[ch_type]
 
         fig, ax = plt.subplots(figsize=(10, 6))
-        for i, cond_i in enumerate(cond_indices):
-            ev = evokeds[cond_i]
+        for i, ev in enumerate(selected_evokeds):
             times_ms = ev.times * 1000
             signal = ev.data[sensor_idx, :] * scale
             ax.plot(times_ms, signal, label=ev.comment, color=colors[i % len(colors)], linewidth=1.5)
@@ -340,9 +413,9 @@ def waveform_browser(evokeds):
                 current_ylims[ch_type] = ylim
                 need_redraw = True
             elif nav in ['cond', 'd']:
-                new_conds = prompt_for_conditions(evokeds)
-                if new_conds:
-                    cond_indices = new_conds
+                new_selection = prompt_for_waveform_conditions(evokeds)
+                if new_selection is not None:
+                    selected_evokeds = new_selection
                     need_redraw = True
             else:
                 found = False
@@ -655,9 +728,10 @@ def regional_grid_plot(evokeds):
         print(f"No sensors found for {region_name} ending in '{suffix}'.")
         return
 
-    # Use your existing prompt to select conditions to overlay
-    cond_indices = prompt_for_conditions(evokeds)
-    if not cond_indices: return
+    # Select conditions to overlay, or build a single difference waveform via 1,-2
+    selected_evokeds = prompt_for_waveform_conditions(evokeds)
+    if selected_evokeds is None:
+        return
 
     # Setup correct units and scale
     if suffix == '1':
@@ -677,8 +751,8 @@ def regional_grid_plot(evokeds):
 
     # Calculate global min/max for regional autoscaling across all selected conditions
     global_min, global_max = float('inf'), float('-inf')
-    for c_idx in cond_indices:
-        data = evokeds[c_idx].data[ch_indices, :] * scale
+    for ev in selected_evokeds:
+        data = ev.data[ch_indices, :] * scale
         global_min = min(global_min, np.min(data))
         global_max = max(global_max, np.max(data))
 
@@ -705,8 +779,7 @@ def regional_grid_plot(evokeds):
         ax = axes[i]
         ch_name = evokeds[0].ch_names[ch_idx]
 
-        for j, c_idx in enumerate(cond_indices):
-            ev = evokeds[c_idx]
+        for j, ev in enumerate(selected_evokeds):
             times_ms = ev.times * 1000
             signal = ev.data[ch_idx, :] * scale
             ax.plot(times_ms, signal, label=ev.comment, color=colors[j % len(colors)], linewidth=1.5)
@@ -819,27 +892,27 @@ def main():
             for i, ev in enumerate(evokeds, 1):
                 print(f"  ({i}) {ev.comment}")
 
-            cond_str = input("\nCondition numbers (comma-separated, or 'all'): ").strip()
-            if handle_global_commands(cond_str): continue
+            selected = prompt_for_waveform_conditions(evokeds, allow_all=True)
+            if selected is None:
+                continue
 
-            selected = evokeds
-            if cond_str.lower() != 'all':
-                try:
-                    selected_indices = [int(x) - 1 for x in cond_str.split(',') if x.strip()]
-                    selected = [evokeds[i] for i in selected_indices if 0 <= i < len(evokeds)]
-                except ValueError:
-                    selected = [evokeds[0]]
-
-            if not selected:
-                selected = [evokeds[0]]
-
-            # Restored warning for multiple conditions
             if len(selected) == 1:
                 selected[0].plot_topo(show=False, title=f"Interactive Layout: {selected[0].comment}")
             else:
-                selected[0].plot_topo(show=False, title=f"Interactive Layout: {len(selected)} conditions")
-                print(f"Note: plot_topo shows the first condition ({selected[0].comment}).")
-                print("For overlaid conditions, use Option 2 or 3 from the main menu.")
+                try:
+                    mne.viz.plot_evoked_topo(
+                        selected,
+                        show=False,
+                        legend=True,
+                        title=f"Interactive Layout: {len(selected)} conditions",
+                    )
+                    print("Overlaying conditions in the interactive layout:")
+                    for ev in selected:
+                        print(f"  - {ev.comment}")
+                except Exception as exc:
+                    print("Could not overlay conditions in the interactive layout; showing the first selection instead.")
+                    print(f"Reason: {exc}")
+                    selected[0].plot_topo(show=False, title=f"Interactive Layout: {selected[0].comment}")
 
             plt.show(block=False)
             focus_terminal()
