@@ -1,0 +1,182 @@
+# ============================================================
+# MEG/EEG Preprocessing Configuration – Resting State
+# ============================================================
+
+# Adapted from preproc_params_sub013_mns.yaml for task-rest.
+# Conservative memory settings for MacBook Pro M3, 36 GB RAM.
+# Goal: spike chasing on combined MEG + EEG.
+
+# ============================================================
+# BIDS DATASET IDENTIFIERS
+# ============================================================
+subject: "013"
+session: "01"
+run: "01"
+task: "rest"
+bids_root: "/Users/gm33/data/epi"
+
+# ============================================================
+# HYBRID / REMOTE I/O (disabled for local run)
+# ============================================================
+remote_io:
+  enabled: false
+  hpc_host: transfer-milgram.ycrc.yale.edu
+  hpc_user: gm33
+  remote_bids_root: /gpfs/milgram/pi/nobre/meg_shared/fairy/bids
+  local_temp_dir: ./temp
+
+# ============================================================
+# MAXWELL FILTERING (tSSS) CALIBRATION
+# ============================================================
+calibration_file: /Users/gm33/meg_pipeline/cals/sss_cal_factory_20230619.dat
+cross_talk_file: /Users/gm33/meg_pipeline/cals/ct_sparse_triux2.fif
+
+# ============================================================
+# BASIC SIGNAL PROCESSING
+# ============================================================
+head_movement:
+  enabled: true
+
+line_freq: 60.0
+stim_include_mask: null        # no triggers in resting state
+head_position_origin: null
+
+# ============================================================
+# TRIGGERS (disabled – resting state has no event triggers)
+# ============================================================
+triggers:
+  stim_channel: null
+  mask: null
+  max_settle_ms: null
+  refractory_ms: null
+  auto_mask_stuck_bits: false
+  stuck_high_frac: null
+  stuck_low_frac: null
+
+# ============================================================
+# (OPTIONAL) SUB-SEGMENT TIME WINDOW
+# ============================================================
+# Analyze only a portion of the recording.
+# Accepts "hh:mm:ss", "mm:ss", seconds (int/float), or null.
+# Omit this block to process the full file.
+# Conservative first pass: 10 minutes.  If this runs
+# comfortably, increase to 20:00 → 30:00 → full file.
+# ============================================================
+time_window:
+  start: "02:00"
+  end:   "17:00"
+
+# ============================================================
+# EEG MONTAGE CONFIGURATION
+# ============================================================
+eeg_handling:
+  montage: /Users/gm33/meg_pipeline/montage/EasyCap_53.sfp
+
+# ============================================================
+# INTERACTIVE PROCESSING CONTROLS
+# ============================================================
+interactive_bad_channels: true
+
+# ============================================================
+# MANUAL OVERRIDES
+# ============================================================
+manual_bad_channels: []
+ica_exclude_eeg: []
+ica_exclude_meg: []
+
+# ============================================================
+# AUTOREJECT ARTIFACT DETECTION
+# ============================================================
+# NOTE: which_types includes mag + eeg for dual-modality spike
+# chasing. Add "grad" once you confirm memory headroom.
+# Epoch duration of 2.0 s is the standard resting-state
+# segmentation for autoreject; this is NOT your spike-review
+# window — it is just the granularity for artifact rejection.
+# ============================================================
+autoreject:
+  enabled: true
+  which_types: [mag, eeg]
+  filter:
+    highpass: 1.0
+    lowpass: 40.0
+    resample_hz: null
+  epoch:
+    duration: 2.0
+    tmin: 0.0
+    tmax: 2.0
+  cv_folds: 5
+  thresh_method: "random_search"
+  n_interpolate: [0]
+  verbose: true
+  consensus_thresh: 0.3
+  global_epoch_thresh: 0.5
+
+# ============================================================
+# INDEPENDENT COMPONENT ANALYSIS (ICA)
+# ============================================================
+# max_ica_duration_sec is the primary memory lever.
+# At ~3 MB/s raw × 8-10× processing overhead, 600 s (10 min)
+# should stay well within 36 GB.  If run-01 loads cleanly,
+# try 900 → 1200 → 1800 on subsequent passes.
+# ============================================================
+ica_preprocessing:
+  eeg:
+    highpass: 1.0
+    lowpass: 40.0
+    resample_hz: 200
+    max_ica_duration_sec: 600
+    interactive: true
+    random_state: 97
+  meg:
+    highpass: 1.0
+    lowpass: 40.0
+    resample_hz: 200
+    max_ica_duration_sec: 600
+    interactive: true
+    random_state: 97
+
+# ============================================================
+# FINAL OUTPUT PROCESSING
+# ============================================================
+# Resampling left at null to preserve spike morphology at the
+# native sampling rate.  If memory is tight downstream, 500 Hz
+# is the lowest safe rate for interictal spike work.
+# ============================================================
+final_filter:
+  highpass: null
+  lowpass: null
+  resample_hz: null
+  drop_channel_types:
+    - hpi
+    - hlc
+    - coil
+
+# ============================================================
+# CHECKPOINT AND RESUME SYSTEM
+# ============================================================
+checkpoint:
+  enabled: true
+  exit_after_checkpoint: false
+  derivatives_root: "/Users/gm33/data/epi/derivatives"
+  pipeline_name: preprocessing
+  atomic_writes: true
+  allow_resume_with_different_yaml: true
+  validate_checkpoint_integrity: true
+  backup_before_overwrite: false
+  max_checkpoint_age_hours: 168
+
+# ============================================================
+# REPRODUCIBILITY CONTROLS
+# ============================================================
+repro:
+  random_state_global: 42
+  record_environment: true
+
+# ============================================================
+# METADATA CORRECTIONS
+# ============================================================
+metadata_fixes:
+  fix_non_eeg_channels: {}
+  fix_generic: {}
+  expert_patch: |
+    print("✅ Expert patch executed successfully.")

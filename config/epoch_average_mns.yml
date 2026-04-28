@@ -49,7 +49,9 @@ filter:
   l_freq: null
   h_freq: null
 
-artifact_suppression: { window: null }
+artifact_suppression:
+  window: [-4, 6]     # milliseconds relative to event (t=0)
+  mode: "zero"        # optional; default "zero"
 
 conditions:
   LMN:

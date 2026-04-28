@@ -1,0 +1,63 @@
+# ============================================================
+# MEG Epoch Averaging Configuration - TFR PADDING
+# Target: benchmark_squid / sub-013 / ses-01 / run-01 (Localizer)
+# ============================================================
+
+# ==== BIDS & run list ====
+bids_root: "/Users/gm33/data/benchmark_squid"
+
+inputs:
+  - subject: "013"
+    session: "01"
+    task: "localizer"
+    run: "01"
+
+# ==== Outputs ====
+outputs:
+  save_evokeds: false            # Turned off to save compute; you already have your ERFs
+  save_epochs: true
+  evokeds_subdir: "derivatives/avg"
+  epochs_subdir: "derivatives/epochs_tfr"  # NEW DIRECTORY to prevent overwrites
+  combined_evokeds: false
+  combined_desc: "all"
+
+# Read ONLY the derivative file:
+derivatives_subdir: "derivatives/preprocessing"
+derivatives_desc: "preproc"
+
+# === Event source and timing correction ===
+events:
+  source: "stim"
+  stim_channel: "STI101"
+  offset_ms: -75
+
+# ==== Global defaults ====
+stim_channel: "STI101"
+reject_by_annotation: true
+tmin: -1.0                       # Extended baseline for TFR
+tmax: 1.5                        # Extended post-stimulus for TFR
+baseline: [null, 0.0]
+
+use_reject: false
+reject:
+  mag: 4e-12
+  grad: 4000e-13
+
+filter:
+  l_freq: null
+  h_freq: null
+
+# ==== Conditions (expression-based) ====
+# - Face identity = bits 1–3 (mask 0x007)
+# - ISI/Context   = bits 4–6 (mask 0x038)
+# - Target flag   = bit 7    (mask 0x040)
+conditions:
+  faces_non_target:
+    expr: "((val & 0x38) != 0) and ((val & 0x40) == 0)"
+  faces_target:
+    expr: "((val & 0x40) != 0)"
+
+# Make sure the individual condition windows match the padded global windows
+epoch_windows:
+  faces_non_target: { tmin: -1.0, tmax: 1.5 }
+  faces_target:     { tmin: -1.0, tmax: 1.5 }

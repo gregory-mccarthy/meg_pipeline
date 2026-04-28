@@ -1,0 +1,163 @@
+# ============================================================
+# MEG Preprocessing Configuration - Local MacBook Pro Run
+# ============================================================
+
+# Created for benchmark_squid / sub-011 / ses-01 / run-01
+# March 7, 2026
+
+# ============================================================
+# BIDS DATASET IDENTIFIERS
+# ============================================================
+subject: "013"
+session: "01"
+run: "01"
+task: "noise"
+bids_root: "/Users/gm33/data/benchmark_squid"
+
+# ============================================================
+# ANNOTATIONS for BAD_breaks
+# ============================================================
+
+annotations:
+  read_events_tsv: false
+  reject_bad_breaks: false  # We will use this in the next pass!
+
+# ============================================================
+# HYBRID / REMOTE I/O (disabled for local run)
+# ============================================================
+remote_io:
+  enabled: false
+  hpc_host: transfer-milgram.ycrc.yale.edu
+  hpc_user: gm33
+  remote_bids_root: /gpfs/milgram/pi/nobre/meg_shared/fairy/bids
+  local_temp_dir: ./temp
+
+# ============================================================
+# MAXWELL FILTERING (tSSS) CALIBRATION
+# ============================================================
+calibration_file: /Users/gm33/meg_pipeline/cals/sss_cal_factory_20230619.dat
+cross_talk_file: /Users/gm33/meg_pipeline/cals/ct_sparse_triux2.fif
+
+# ============================================================
+# BASIC SIGNAL PROCESSING
+# ============================================================
+head_movement:
+  enabled: false
+
+line_freq: 60.0
+stim_include_mask: "0xFFFF"
+head_position_origin: null
+
+# ============================================================
+# TRIGGERS
+# ============================================================
+triggers:
+  stim_channel: "STI101"
+  mask: "0xFFFF"
+  max_settle_ms: 6.0
+  refractory_ms: 20.0
+  auto_mask_stuck_bits: false
+  stuck_high_frac: 0.98
+  stuck_low_frac: 0.02
+
+# ============================================================
+# EEG MONTAGE CONFIGURATION
+# ============================================================
+# No EEG recorded for this subject.
+eeg_handling:
+  montage: null
+
+# ============================================================
+# INTERACTIVE PROCESSING CONTROLS
+# ============================================================
+interactive_bad_channels: true
+
+# ============================================================
+# MANUAL OVERRIDES
+# ============================================================
+manual_bad_channels: []
+ica_exclude_eeg: []
+ica_exclude_meg: []
+
+# ============================================================
+# AUTOREJECT ARTIFACT DETECTION
+# ============================================================
+autoreject:
+  enabled: false
+  which_types: [mag]
+  filter:
+    highpass: 1.0
+    lowpass: 40.0
+    resample_hz: null
+  epoch:
+    duration: 2.0
+    tmin: 0.0
+    tmax: 2.0
+  cv_folds: 5
+  thresh_method: "random_search"
+  # thresh_method: "bayesian_optimization"
+  n_interpolate: [0]
+  verbose: true
+  consensus_thresh: 0.3
+  global_epoch_thresh: 0.5
+
+# ============================================================
+# INDEPENDENT COMPONENT ANALYSIS (ICA)
+# ============================================================
+ica_preprocessing:
+  eeg:
+    highpass: 1.0
+    lowpass: 40.0
+    resample_hz: 200
+    max_ica_duration_sec: 1800
+    interactive: true
+    random_state: 97
+  meg:
+    highpass: 1.0
+    lowpass: 40.0
+    resample_hz: 200
+    max_ica_duration_sec: 1800
+    interactive: true
+    random_state: 97
+
+# ============================================================
+# FINAL OUTPUT PROCESSING
+# ============================================================
+final_filter:
+  highpass: null
+  lowpass: null
+  resample_hz: null
+  drop_channel_types:
+    - hpi
+    - hlc
+    - coil
+
+# ============================================================
+# CHECKPOINT AND RESUME SYSTEM
+# ============================================================
+checkpoint:
+  enabled: true
+  exit_after_checkpoint: false
+  derivatives_root: "/Users/gm33/data/benchmark_squid/derivatives"
+  pipeline_name: preprocessing
+  atomic_writes: true
+  allow_resume_with_different_yaml: true
+  validate_checkpoint_integrity: true
+  backup_before_overwrite: false
+  max_checkpoint_age_hours: 168
+
+# ============================================================
+# REPRODUCIBILITY CONTROLS
+# ============================================================
+repro:
+  random_state_global: 42
+  record_environment: true
+
+# ============================================================
+# METADATA CORRECTIONS
+# ============================================================
+metadata_fixes:
+  fix_non_eeg_channels: {}
+  fix_generic: {}
+  expert_patch: |
+    print("✅ Expert patch executed successfully.")

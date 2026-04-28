@@ -1,0 +1,37 @@
+# ============================================================
+# MEG Time-Frequency Representation (TFR) Configuration
+# Target: benchmark_squid / sub-013 / ses-01 / run-01 (Localizer)
+# Method: Multitaper (Optimized for frequency smoothing)
+# ============================================================
+
+bids_root: "/Users/gm33/data/benchmark_squid"
+
+inputs:
+  - subject: "013"
+    session: "01"
+    task: "localizer"
+    run: "01"
+
+# Read from the padded epochs you just generated
+derivatives_subdir: "derivatives/epochs_tfr"
+
+tfr_params:
+  method: "multitaper"       # Switched to multitaper
+  power_type: "induced"
+  freqs: [4, 6, 8, 10, 15, 20, 30, 40, 60, 80]
+  n_cycles: [2, 3, 4, 5, 7.5, 10, 15, 20, 30, 40] # Scaled cycles to fit the epoch!
+  time_bandwidth: 4.0        # NEW: Controls frequency smoothing (MNE default is 4.0)
+  use_fft: true
+  return_itc: false
+  n_jobs: 1
+
+post_processing:
+  crop:
+    tmin: -0.1          # Crops away the padded edges
+    tmax: 0.5
+  baseline:
+    window: [-0.1, 0.0]
+    mode: "logratio"
+
+outputs:
+  tfr_subdir: "derivatives/tfr"
