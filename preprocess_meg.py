@@ -43,7 +43,7 @@ from datetime import datetime, timezone
 import json
 import numpy as np
 import matplotlib  # safe to import; do NOT import pyplot yet
-from bids_io_utils import parse_time_window, apply_bids_events_tsv
+from bids_io_utils import parse_time_window, apply_bids_events_tsv, apply_bids_channels_tsv
 
 # Use distinct aliases (no shadowing)
 #import bids_io_utils_v2 as bdu   # BIDS/data utilities
@@ -351,15 +351,23 @@ def run_stage1_pipeline(yaml_path: str, p: dict):
         p.get("metadata_fixes", {}),
     )
 
-    # 5b. Mark Manual Bad Channels (CRITICAL BEFORE MAXWELL)
-    manual_bads = p.get("manual_bad_channels", [])
-    if manual_bads:
-        # Ensure we don't add duplicates
-        current_bads = set(raw.info.get('bads', []))
-        new_bads = current_bads.union(manual_bads)
-        raw.info['bads'] = list(new_bads)
-        logger.info(f"Marked manual bad channels from YAML: {manual_bads}")
+    # 5b. Bad Channel Processing (CRITICAL BEFORE MAXWELL)
+    # Target 1: Dynamic sidecars from the annotation step
+    tsv_bad_channels = apply_bids_channels_tsv(raw, raw_fif_path, logger=logger)
 
+    # Target 2: Static damaged sensors designated globally in the YAML file
+    yaml_bad_channels = p.get("manual_bad_channels", [])
+    if yaml_bad_channels:
+        logger.info(f"[Channels] Found static bad channels in YAML configuration: {yaml_bad_channels}")
+
+    # Set-union the distinct sources to establish the true bad channel list
+    existing_bads = set(raw.info.get('bads', []))
+    unified_bads = existing_bads.union(tsv_bad_channels).union(yaml_bad_channels)
+
+    raw.info['bads'] = list(unified_bads)
+
+    logger.info(f"[Channels] Combined Maxwell exclusion list: {raw.info['bads']}")
+    logger.info(f"   - (Inherited/Raw: {len(existing_bads)} | TSV: {len(tsv_bad_channels)} | YAML: {len(yaml_bad_channels)})")
 
     # 6. PSD & RMS Diagnostics (Pre-filtering)
     utils.log_section("6. PSD & RMS Diagnostics (Pre-filtering)")

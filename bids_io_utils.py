@@ -926,3 +926,53 @@ def apply_bids_events_tsv(raw: mne.io.BaseRaw, fif_path: Union[str, Path], logge
             logger.error(f"[Annotations] Failed to read or apply annotations from TSV: {e}")
 
     return raw
+
+def apply_bids_channels_tsv(raw: mne.io.BaseRaw, fif_path: Union[str, Path], logger=None) -> List[str]:
+    """
+    Looks for a companion _channels.tsv file in the same directory as the raw file.
+    If found, extracts channels where status == 'bad'.
+
+    Returns:
+        List of bad channel names found in the TSV (empty list if none or missing).
+    """
+    import os
+
+    base_dir = os.path.dirname(fif_path)
+    base_name = os.path.basename(fif_path)
+
+    if base_name.endswith('_meg.fif'):
+        tsv_name = base_name.replace('_meg.fif', '_channels.tsv')
+    else:
+        # Fallback split-stripping logic matching find_first_file_for_run
+        import re
+        clean_name = re.sub(r"_split-(\d+)_meg\.fif$", "", base_name)
+        clean_name = re.sub(r"_meg(?:-\d+)?\.fif$", "", clean_name)
+        tsv_name = f"{clean_name}_channels.tsv"
+
+    tsv_path = os.path.join(base_dir, tsv_name)
+
+    if not os.path.exists(tsv_path):
+        if logger:
+            logger.info(f"[Channels] No companion _channels.tsv found at {tsv_path}.")
+        return []
+
+    if logger:
+        logger.info(f"[Channels] Found companion TSV. Inspecting bad channels from: {tsv_path}")
+
+    try:
+        df = pd.read_csv(tsv_path, sep='\t')
+        if 'name' in df.columns and 'status' in df.columns:
+            tsv_bads = df[df['status'] == 'bad']['name'].tolist()
+            # Filter to ensure they actually exist in the raw instance
+            valid_tsv_bads = [ch for ch in tsv_bads if ch in raw.ch_names]
+            if logger and valid_tsv_bads:
+                logger.info(f"[Channels] Successfully extracted {len(valid_tsv_bads)} bad channel(s) from TSV.")
+            return valid_tsv_bads
+        else:
+            if logger:
+                logger.warning("[Channels] TSV is missing required BIDS columns ('name', 'status'). Skipping.")
+    except Exception as e:
+        if logger:
+            logger.error(f"[Channels] Failed to read bad channels from TSV: {e}")
+
+    return []
